@@ -30,7 +30,7 @@ typedef struct ds4_ep_context {
 /* Contiguous owned expert range for `rank` of `world_size`, remainder spread
  * over the lowest ranks (rank r<rem gets one extra). A contiguous id-range maps
  * to a contiguous byte-range in the per-expert tensors, so a rank can load only
- * its slice. Writes *start_out/*count_out (either may be NULL).
+ * its slice. The range is written to start_out and count_out (either may be NULL).
  * Returns 0 on success, -1 on invalid args (world_size<=0, rank out of range,
  * or n_total_expert==0). */
 int ds4_ep_expert_range(uint32_t n_total_expert, int world_size, int rank,
