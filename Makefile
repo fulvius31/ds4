@@ -40,7 +40,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test cpu cuda cuda-spark cuda-spark-ep cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -82,6 +82,7 @@ all: help
 help:
 	@echo "DS4 build targets:"
 	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10"
+	@echo "  make cuda-spark-ep       Build CUDA two-Spark Expert Parallelism (NCCL; experimental)"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
@@ -92,6 +93,16 @@ help:
 
 cuda-spark:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
+
+# Expert Parallelism build (two Sparks, NCCL over RoCE). Experimental; see
+# EP_IMPLEMENTATION_PLAN.md. Adds ds4_cuda_ep.o + ds4_ep.o, defines DS4_EP_BUILD
+# for both host (.c) and device (.cu) compiles, and links NCCL.
+cuda-spark-ep:
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH= \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o ds4_cuda_ep.o ds4_ep.o" \
+		CFLAGS="$(CFLAGS) -DDS4_EP_BUILD" \
+		NVCCFLAGS="$(NVCCFLAGS) -DDS4_EP_BUILD" \
+		DS4_LINK_LIBS="$(CUDA_LDLIBS) -lnccl"
 
 cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
@@ -210,6 +221,12 @@ ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
+
+ds4_ep.o: ds4_ep.c ds4_ep.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_ep.c
+
+ds4_cuda_ep.o: ds4_cuda_ep.cu ds4_gpu.h
+	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda_ep.cu
 
 ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu

@@ -1017,6 +1017,26 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* ---- Expert Parallelism (EP) collectives -----------------------------------
+ * Implemented only in the CUDA backend, backed by NCCL over RoCE, and compiled
+ * in only under -DDS4_EP_BUILD (default builds are unaffected). See
+ * EP_IMPLEMENTATION_PLAN.md. Host-side expert partitioning lives in ds4_ep.h.
+ *
+ *   ds4_gpu_collective_init  - join the NCCL communicator. world_size/rank
+ *       identify this process; bootstrap_id/bootstrap_bytes carry the 128-byte
+ *       ncclUniqueId broadcast out-of-band (reusing the ds4_distributed TCP
+ *       rendezvous). Returns 1 on success, 0 on failure.
+ *   ds4_gpu_all_reduce_f32   - in-place sum-all-reduce of `count` float32
+ *       elements of `tensor` across all ranks, on the collective stream.
+ *       Returns 1 on success, 0 on failure.
+ *   ds4_gpu_collective_shutdown - destroy the communicator. */
+#ifdef DS4_EP_BUILD
+int  ds4_gpu_collective_init(int world_size, int rank,
+                             const void *bootstrap_id, uint64_t bootstrap_bytes);
+int  ds4_gpu_all_reduce_f32(ds4_gpu_tensor *tensor, uint64_t count);
+void ds4_gpu_collective_shutdown(void);
+#endif /* DS4_EP_BUILD */
+
 #ifdef __cplusplus
 }
 #endif
