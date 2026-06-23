@@ -105,10 +105,17 @@ halving resident expert memory — the whole point for PRO.
   the full `ds4.c` wiring — engine/graph `ep` field, init/bootstrap/shutdown, the
   per-layer router mask (decode + prefill) and routed-output all-reduce (3 decode
   sites + 1 prefill). All behind `-DDS4_EP_BUILD`; default builds untouched.
-- **Correctness-complete, NOT yet perf-optimized:** each rank still *computes* all
-  selected experts (non-owned weighted to 0) — correct, but the memory/compute
-  *saving* (load only the owned slice via the streaming-selected cache, lever 2)
-  is the next step. So EP is expected to be correct first, faster second.
+- **Load-skip done (streaming path):** under `--ssd-streaming`, each rank now loads
+  only its owned experts — the streaming-selected compaction
+  (`ds4_gpu_stream_expert_cache_begin_selected_load` / `_prepare_selected_batch`)
+  filters `compact_ids` to the owned id-range, and non-owned selected slots fall
+  back to a valid zero-weight dummy slot (no MoE-kernel change). This is the memory
+  win that lets PRO fit. The owned range is threaded via
+  `ds4_gpu_stream_expert_table.owned_*` from a process-static set at engine open.
+- **Compute-skip is the remaining optimization:** each rank still *runs* the
+  dot-products for non-owned slots (then multiplies by 0). Avoiding that needs a
+  small `DS4_EP_BUILD`-guarded skip of zero-weight pairs in the MoE bucket kernels.
+  Non-streaming builds stay correct (weight-masked) but load all experts.
 - **Pending two Sparks:** all of §7/§10.3 (run-time correctness + EP-vs-pipeline).
 - **Run anywhere with a compiler:** `sh tests/run_ep_selftest.sh` (partition math).
 

@@ -3144,15 +3144,40 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
                     layer);
             return 0;
         }
-        expert_to_slot[(uint32_t)expert_i] = -2;
+        {
+            bool ep_owned = true;
+#ifdef DS4_EP_BUILD
+            if (table->owned_enabled)
+                ep_owned = ((uint32_t)expert_i >= table->owned_start &&
+                            (uint32_t)expert_i <  table->owned_start + table->owned_count);
+#endif
+            if (ep_owned) expert_to_slot[(uint32_t)expert_i] = -2;
+        }
     }
     for (uint32_t e = 0; e < n_total_expert; e++) {
         if (expert_to_slot[e] != -2) continue;
         expert_to_slot[e] = (int32_t)compact_ids.size();
         compact_ids.push_back((int32_t)e);
     }
+#ifdef DS4_EP_BUILD
+    if (table->owned_enabled && compact_ids.empty()) {
+        /* This rank owns none of the selected experts for this batch; load one
+         * owned expert so slot 0 is valid. Every non-owned selected slot maps to
+         * it with router weight 0 (set by ds4_gpu_router_mask_owned), so it
+         * contributes exactly zero and the all-reduce reassembles the full sum. */
+        uint32_t ep_dummy = table->owned_start < n_total_expert ? table->owned_start : 0u;
+        expert_to_slot[ep_dummy] = 0;
+        compact_ids.push_back((int32_t)ep_dummy);
+    }
+#endif
     for (uint32_t i = 0; i < n_selected; i++) {
-        slot_ids[i] = expert_to_slot[(uint32_t)selected_ids[i]];
+        {
+            int32_t s = expert_to_slot[(uint32_t)selected_ids[i]];
+#ifdef DS4_EP_BUILD
+            if (s < 0) s = 0;  /* non-owned under EP: slot 0 (weight already 0) */
+#endif
+            slot_ids[i] = s;
+        }
     }
     if (compact_ids.empty() || compact_ids.size() > UINT32_MAX) return 0;
     return cuda_stream_selected_cache_begin_compact_load(
@@ -3213,15 +3238,40 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                     layer);
             return 0;
         }
-        expert_to_slot[(uint32_t)expert_i] = -2;
+        {
+            bool ep_owned = true;
+#ifdef DS4_EP_BUILD
+            if (table->owned_enabled)
+                ep_owned = ((uint32_t)expert_i >= table->owned_start &&
+                            (uint32_t)expert_i <  table->owned_start + table->owned_count);
+#endif
+            if (ep_owned) expert_to_slot[(uint32_t)expert_i] = -2;
+        }
     }
     for (uint32_t e = 0; e < n_total_expert; e++) {
         if (expert_to_slot[e] != -2) continue;
         expert_to_slot[e] = (int32_t)compact_ids.size();
         compact_ids.push_back((int32_t)e);
     }
+#ifdef DS4_EP_BUILD
+    if (table->owned_enabled && compact_ids.empty()) {
+        /* This rank owns none of the selected experts for this batch; load one
+         * owned expert so slot 0 is valid. Every non-owned selected slot maps to
+         * it with router weight 0 (set by ds4_gpu_router_mask_owned), so it
+         * contributes exactly zero and the all-reduce reassembles the full sum. */
+        uint32_t ep_dummy = table->owned_start < n_total_expert ? table->owned_start : 0u;
+        expert_to_slot[ep_dummy] = 0;
+        compact_ids.push_back((int32_t)ep_dummy);
+    }
+#endif
     for (uint32_t i = 0; i < slot_count; i++) {
-        slot_ids[i] = expert_to_slot[(uint32_t)selected_ids[i]];
+        {
+            int32_t s = expert_to_slot[(uint32_t)selected_ids[i]];
+#ifdef DS4_EP_BUILD
+            if (s < 0) s = 0;  /* non-owned under EP: slot 0 (weight already 0) */
+#endif
+            slot_ids[i] = s;
+        }
     }
 
     if (compact_ids.empty() || compact_ids.size() > UINT32_MAX) return 0;

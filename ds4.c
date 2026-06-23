@@ -3370,6 +3370,12 @@ static uint32_t ds4_streaming_cache_experts_for_byte_budget(
 }
 
 #ifndef DS4_NO_GPU
+#ifdef DS4_EP_BUILD
+/* EP owned-expert range, captured at engine open; consulted when building the
+ * streaming-selected expert table so each rank loads only its owned experts. */
+static ds4_ep_context g_ds4_streaming_ep;
+#endif
+
 static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
         const ds4_model         *model,
         const ds4_layer_weights *layer,
@@ -3388,6 +3394,11 @@ static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
     table.down_offset = layer->ffn_down_exps ? layer->ffn_down_exps->abs_offset : 0;
     table.gate_expert_bytes = gate_expert_bytes;
     table.down_expert_bytes = down_expert_bytes;
+#ifdef DS4_EP_BUILD
+    table.owned_enabled = g_ds4_streaming_ep.enabled;
+    table.owned_start = g_ds4_streaming_ep.expert_start;
+    table.owned_count = g_ds4_streaming_ep.expert_count;
+#endif
     return table;
 }
 #endif
@@ -25779,6 +25790,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             fprintf(stderr, "ds4: EP enabled, rank %d/%d owns experts [%u, %u)\n",
                     e->ep.rank, e->ep.world_size,
                     e->ep.expert_start, e->ep.expert_start + e->ep.expert_count);
+            g_ds4_streaming_ep = e->ep;
         }
 #endif
         ds4_gpu_set_quality(e->quality);

@@ -87,6 +87,9 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    down_offset;
     uint64_t    gate_expert_bytes;
     uint64_t    down_expert_bytes;
+    uint32_t    owned_start;    /* EP: first owned routed-expert id (load-skip)  */
+    uint32_t    owned_count;    /* EP: number of owned routed experts            */
+    int         owned_enabled;  /* EP: 1 = load only the owned id-range           */
 } ds4_gpu_stream_expert_table;
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */
