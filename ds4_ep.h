@@ -13,6 +13,7 @@
  * actual collective ops live in the CUDA backend behind -DDS4_EP_BUILD. */
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,6 +49,15 @@ int ds4_ep_context_init(ds4_ep_context *ep, int world_size, int rank,
 /* Initialize from DS4_EP_WORLD_SIZE / DS4_EP_RANK (default world_size=1 =
  * disabled). Returns 0 on success, -1 if rank>=world_size or partition fails. */
 int ds4_ep_context_from_env(ds4_ep_context *ep, uint32_t n_total_expert);
+
+/* Broadcast the `cap`-byte ncclUniqueId across ranks over TCP, env-driven:
+ * DS4_EP_MASTER_ADDR (default 127.0.0.1) and DS4_EP_MASTER_PORT (default 29500).
+ * rank 0 listens and sends `local_id` to every peer; other ranks connect (with
+ * retry) and receive into `id_out`. `local_id` is read only on rank 0; on the
+ * single-rank/disabled case it is copied straight to `id_out`. Pure host C (no
+ * CUDA). Returns 0 on success, -1 on error. */
+int ds4_ep_bootstrap_exchange(const ds4_ep_context *ep,
+                              const void *local_id, void *id_out, size_t cap);
 
 #ifdef __cplusplus
 }

@@ -85,23 +85,32 @@ halving resident expert memory — the whole point for PRO.
 
 ## 7. Validation plan (needs two Sparks)
 
-1. **Correctness first:** run with `world_size=2` but **replicated** experts (both
-   ranks own all) + a dummy all-reduce → decode must be **bit-identical** to
-   single-rank. Confirms the collective/bootstrap don't corrupt state.
-2. **EP correctness:** enable the real shard; verify PRO decode matches the
+1. **Correctness on Flash (fits one rank):** run EP with `DS4_EP_WORLD_SIZE=2`
+   (disjoint halves — the default `ds4_ep_expert_range` partition) and compare
+   decode to a **single-rank** run. They should match within floating-point
+   tolerance — *not* bit-identical, because the all-reduce reorders the expert
+   sum (FP add is non-associative). This proves masking + collective + bootstrap
+   reassemble the full routed output. (Note: "both ranks own all experts" would
+   DOUBLE-count through the sum-all-reduce — the disjoint partition is the point.)
+2. **EP correctness on PRO:** the real target; verify PRO decode matches the
    pipeline-mode reference (PRO doesn't fit one Spark, so pipeline is the oracle).
 3. **EP performance:** PRO decode tok/s **EP-2-Spark vs pipeline-2-Spark**. EP must
    win or the collective overhead ate the bandwidth saving → reconsider.
 
 ## 8. Status
 
-- **Done now (this commit, authored — NOT compiled/tested; no toolchain on the dev box):**
-  `ds4_ep.{h,c}` (partition logic + self-test) and the `ds4_gpu.h` collective
-  declarations.
-- **Next, when a compiler is available:** `cc -DDS4_EP_SELFTEST ds4_ep.c -o t && ./t`
-  to validate the partition math.
-- **Pending hardware (two Sparks + CUDA + NCCL):** the NCCL impl, the MoE dispatch
-  change, the bootstrap, the Makefile target, and all of §7.
+- **Implemented and compiled** (`make cuda-spark-ep` builds clean on aarch64/CUDA
+  13.2/NCCL): host partition (`ds4_ep.{h,c}` + self-test), TCP bootstrap, the NCCL
+  collectives + router-mask kernel (`ds4_cuda_ep.cu`), the ABI (`ds4_gpu.h`), and
+  the full `ds4.c` wiring — engine/graph `ep` field, init/bootstrap/shutdown, the
+  per-layer router mask (decode + prefill) and routed-output all-reduce (3 decode
+  sites + 1 prefill). All behind `-DDS4_EP_BUILD`; default builds untouched.
+- **Correctness-complete, NOT yet perf-optimized:** each rank still *computes* all
+  selected experts (non-owned weighted to 0) — correct, but the memory/compute
+  *saving* (load only the owned slice via the streaming-selected cache, lever 2)
+  is the next step. So EP is expected to be correct first, faster second.
+- **Pending two Sparks:** all of §7/§10.3 (run-time correctness + EP-vs-pipeline).
+- **Run anywhere with a compiler:** `sh tests/run_ep_selftest.sh` (partition math).
 
 ## 9. Risks (recap)
 
@@ -142,10 +151,11 @@ all_reduce_perf -b 16K -e 32K -f 2 -g 1     # small-message all-reduce; read tim
 
 ### 10.3 EP correctness & performance — needs two Sparks + the full EP build
 
-1. **Replicated-weights run** (`DS4_EP_WORLD_SIZE=2`, both ranks own all experts) →
-   decode must be **bit-identical** to single-rank. Proves the collective +
-   bootstrap don't corrupt state.
-2. **Real shard** → PRO decode must match the **pipeline-mode** reference (PRO
-   doesn't fit one Spark, so pipeline is the oracle).
+1. **EP correctness on Flash** (`DS4_EP_WORLD_SIZE=2`, disjoint halves — Flash fits
+   one rank) → decode matches a **single-rank** run within FP tolerance (the
+   all-reduce reorders the sum, so close but not bit-identical). Proves masking +
+   collective + bootstrap are correct.
+2. **EP correctness on PRO** → PRO decode must match the **pipeline-mode** reference
+   (PRO doesn't fit one Spark, so pipeline is the oracle).
 3. **Perf** → PRO decode tok/s **EP-2-Spark vs pipeline-2-Spark**; EP must win or
    the collective overhead ate the bandwidth saving.

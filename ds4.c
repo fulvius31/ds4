@@ -41,6 +41,7 @@
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+#include "ds4_ep.h"
 #endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -10492,6 +10493,7 @@ typedef struct {
     bool streaming_static_decode_map_current;
     bool mtp_enabled;
     float *cpu_router_norm;
+    ds4_ep_context ep;   /* expert-parallel context; disabled unless DS4_EP_BUILD */
 } ds4_gpu_graph;
 
 static bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
@@ -15587,6 +15589,15 @@ static bool metal_graph_encode_decode_layer(
     }
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) ok = metal_graph_profile_router_selection(g, layer, il, pos);
+#ifdef DS4_EP_BUILD
+        /* EP: run the router replicated, then drop slots whose expert is owned
+         * by another rank, so this rank's routed_out covers only its experts.
+         * The per-layer all-reduce after the MoE reassembles the full sum. */
+        if (ok && g->ep.enabled)
+            ok = ds4_gpu_router_mask_owned(g->router_selected, g->router_weights,
+                                           DS4_N_EXPERT_USED,
+                                           g->ep.expert_start, g->ep.expert_count) != 0;
+#endif
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_probs", g->router_probs, DS4_N_EXPERT, il, pos);
@@ -15708,6 +15719,10 @@ static bool metal_graph_encode_decode_layer(
                                                      DS4_N_EXPERT,
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                      il) != 0;
+#ifdef DS4_EP_BUILD
+        if (ok && g->ep.enabled)
+            ok = ds4_gpu_all_reduce_f32(g->routed_out, DS4_N_EMBD) != 0;
+#endif
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
@@ -15881,6 +15896,10 @@ static bool metal_graph_encode_decode_layer(
                                                      DS4_N_EXPERT,
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                      il) != 0;
+#ifdef DS4_EP_BUILD
+        if (ok && g->ep.enabled)
+            ok = ds4_gpu_all_reduce_f32(g->routed_out, DS4_N_EMBD) != 0;
+#endif
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
@@ -15965,6 +15984,10 @@ static bool metal_graph_encode_decode_layer(
                                                  DS4_N_EXPERT,
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                  il) != 0;
+#ifdef DS4_EP_BUILD
+    if (ok && g->ep.enabled)
+        ok = ds4_gpu_all_reduce_f32(g->routed_out, DS4_N_EMBD) != 0;
+#endif
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
@@ -19144,6 +19167,14 @@ static bool metal_graph_encode_layer_ffn_batch(
 #endif
 
     if (ok) {
+#ifdef DS4_EP_BUILD
+        /* EP: mask non-owned experts out of the replicated router output before
+         * the routed MoE; the all-reduce after reassembles the full sum. */
+        if (g->ep.enabled)
+            (void)ds4_gpu_router_mask_owned(g->batch_router_selected, g->batch_router_weights,
+                                            (uint32_t)n_tokens * DS4_N_EXPERT_USED,
+                                            g->ep.expert_start, g->ep.expert_count);
+#endif
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                                g->batch_routed_gate,
                                                g->batch_routed_up,
@@ -19197,6 +19228,11 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("ffn_moe_out", g->batch_routed_out,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
+#ifdef DS4_EP_BUILD
+    if (ok && g->ep.enabled)
+        ok = ds4_gpu_all_reduce_f32(g->batch_routed_out,
+                                    (uint64_t)n_tokens * DS4_N_EMBD) != 0;
+#endif
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
     if (!shared_done) {
         DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
@@ -21828,6 +21864,7 @@ struct ds4_engine {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     ds4_distributed_options distributed;
+    ds4_ep_context ep;   /* expert-parallel context; disabled unless DS4_EP_BUILD */
     bool metal_ready;
     bool mtp_ready;
 };
@@ -25721,6 +25758,29 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+#ifdef DS4_EP_BUILD
+        if (ds4_ep_context_from_env(&e->ep, DS4_N_EXPERT) == 0 && e->ep.enabled) {
+            unsigned char ep_id[128];
+            int ep_ok = 1;
+            if (e->ep.rank == 0)
+                ep_ok = ds4_gpu_collective_unique_id(ep_id, sizeof ep_id);
+            if (ep_ok && ds4_ep_bootstrap_exchange(&e->ep, ep_id, ep_id, sizeof ep_id) != 0)
+                ep_ok = 0;
+            if (ep_ok)
+                ep_ok = ds4_gpu_collective_init(e->ep.world_size, e->ep.rank,
+                                                ep_id, sizeof ep_id);
+            if (!ep_ok) {
+                fprintf(stderr, "ds4: EP collective init failed (rank %d/%d)\n",
+                        e->ep.rank, e->ep.world_size);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            fprintf(stderr, "ds4: EP enabled, rank %d/%d owns experts [%u, %u)\n",
+                    e->ep.rank, e->ep.world_size,
+                    e->ep.expert_start, e->ep.expert_start + e->ep.expert_count);
+        }
+#endif
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
         if (!ds4_engine_configure_streaming_auto_cache(e)) {
@@ -26027,6 +26087,9 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->mtp_ready) model_close(&e->mtp_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
+#ifdef DS4_EP_BUILD
+    ds4_gpu_collective_shutdown();
+#endif
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
@@ -26082,6 +26145,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
     s->graph.streaming_preload_experts = e->ssd_streaming_preload_experts;
     s->graph.power_percent = (uint32_t)e->power_percent;
+    s->graph.ep = e->ep;
     if (!metal_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,

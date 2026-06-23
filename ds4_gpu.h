@@ -1022,18 +1022,26 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
  * in only under -DDS4_EP_BUILD (default builds are unaffected). See
  * EP_IMPLEMENTATION_PLAN.md. Host-side expert partitioning lives in ds4_ep.h.
  *
+ *   ds4_gpu_collective_unique_id - rank 0 mints a 128-byte ncclUniqueId; the
+ *       host broadcasts it (ds4_ep_bootstrap_exchange) before collective_init.
  *   ds4_gpu_collective_init  - join the NCCL communicator. world_size/rank
- *       identify this process; bootstrap_id/bootstrap_bytes carry the 128-byte
- *       ncclUniqueId broadcast out-of-band (reusing the ds4_distributed TCP
- *       rendezvous). Returns 1 on success, 0 on failure.
+ *       identify this process; bootstrap_id/bootstrap_bytes carry the broadcast
+ *       ncclUniqueId. Returns 1 on success, 0 on failure.
  *   ds4_gpu_all_reduce_f32   - in-place sum-all-reduce of `count` float32
- *       elements of `tensor` across all ranks, on the collective stream.
- *       Returns 1 on success, 0 on failure.
+ *       elements of `tensor` across all ranks, on the default stream.
+ *   ds4_gpu_router_mask_owned - zero the router weight of any of the `n_slots`
+ *       selected slots whose expert id is outside [owned_start, +owned_count),
+ *       so this rank contributes only its owned experts (mask AFTER router
+ *       select, BEFORE the routed-MoE call).
  *   ds4_gpu_collective_shutdown - destroy the communicator. */
 #ifdef DS4_EP_BUILD
+int  ds4_gpu_collective_unique_id(void *out_id, uint64_t bytes);
 int  ds4_gpu_collective_init(int world_size, int rank,
                              const void *bootstrap_id, uint64_t bootstrap_bytes);
 int  ds4_gpu_all_reduce_f32(ds4_gpu_tensor *tensor, uint64_t count);
+int  ds4_gpu_router_mask_owned(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                               uint32_t n_slots, uint32_t owned_start,
+                               uint32_t owned_count);
 void ds4_gpu_collective_shutdown(void);
 #endif /* DS4_EP_BUILD */
 
