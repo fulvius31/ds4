@@ -1026,7 +1026,14 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
     }
     g_model_stage_bytes = 0;
     if (!g_model_upload_stream) {
-        cudaError_t err = cudaStreamCreateWithFlags(&g_model_upload_stream, cudaStreamNonBlocking);
+        /* Blocking (cudaStreamDefault), NOT cudaStreamNonBlocking: this stream's async
+         * H2D copies write reused weight-cache buffers that default-stream compute
+         * kernels read. A non-blocking stream overlaps the compute and creates a WAR
+         * hazard -> nondeterministic garbage under --ssd-streaming on large (PRO) models
+         * that churn the cache. Blocking serializes it with the legacy default stream.
+         * REQUIRES compute on the legacy default stream: do NOT add --default-stream
+         * per-thread to NVCCFLAGS, or this serialization (and the fix) silently breaks. */
+        cudaError_t err = cudaStreamCreateWithFlags(&g_model_upload_stream, cudaStreamDefault);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: CUDA model upload stream creation failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
@@ -1723,8 +1730,11 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
     }
     g_stream_selected_stage_bytes = 0;
     if (!g_stream_selected_upload_stream) {
+        /* Blocking (see g_model_upload_stream above): the compact expert buffer this
+         * stream uploads is read by the default-stream MoE GEMM; a non-blocking stream
+         * races it (WAR) -> nondeterministic garbage under --ssd-streaming. */
         cudaError_t err = cudaStreamCreateWithFlags(&g_stream_selected_upload_stream,
-                                                    cudaStreamNonBlocking);
+                                                    cudaStreamDefault);
         if (err != cudaSuccess) {
             fprintf(stderr,
                     "ds4: CUDA streaming selected upload stream creation failed: %s\n",
