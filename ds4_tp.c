@@ -151,7 +151,7 @@ int ds4_tp_bootstrap_exchange(int world_size, int rank,
                               const void *local_id, void *id_out, size_t cap) {
     if (!id_out || cap == 0) return -1;
     if (world_size <= 1) {
-        if (local_id) memcpy(id_out, local_id, cap);
+        if (local_id && id_out != local_id) memcpy(id_out, local_id, cap);
         return 0;
     }
 
@@ -162,7 +162,7 @@ int ds4_tp_bootstrap_exchange(int world_size, int rank,
 
     if (rank == 0) {
         if (!local_id) return -1;
-        memcpy(id_out, local_id, cap);
+        if (id_out != local_id) memcpy(id_out, local_id, cap);
         int lfd = tp_listen_fd(addr, port, world_size);
         if (lfd < 0) {
             fprintf(stderr, "ds4 TP: bootstrap listen %s:%s failed: %s\n",

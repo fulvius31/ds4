@@ -469,8 +469,16 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
 
+    /* Under Tensor Parallelism (DS4_TP_WORLD_SIZE>1) every rank must sample the
+     * SAME token each step (the all-reduced logits are identical across ranks),
+     * or the per-layer all-reduce desyncs and hangs. A random per-process seed
+     * would diverge, so default to a fixed seed when TP is on (an explicit
+     * --seed, set identically on both ranks, still overrides). */
+    const char *tp_ws_env = getenv("DS4_TP_WORLD_SIZE");
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
-        ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+        ((tp_ws_env && strtol(tp_ws_env, NULL, 10) > 1)
+            ? 0x9E3779B97F4A7C15ULL
+            : ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock()));
     int generated = 0;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
@@ -1136,8 +1144,16 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
 
+    /* Under Tensor Parallelism (DS4_TP_WORLD_SIZE>1) every rank must sample the
+     * SAME token each step (the all-reduced logits are identical across ranks),
+     * or the per-layer all-reduce desyncs and hangs. A random per-process seed
+     * would diverge, so default to a fixed seed when TP is on (an explicit
+     * --seed, set identically on both ranks, still overrides). */
+    const char *tp_ws_env = getenv("DS4_TP_WORLD_SIZE");
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
-        ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+        ((tp_ws_env && strtol(tp_ws_env, NULL, 10) > 1)
+            ? 0x9E3779B97F4A7C15ULL
+            : ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock()));
     int generated = 0;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
