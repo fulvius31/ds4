@@ -14890,6 +14890,11 @@ static bool metal_graph_encode_decode_layer(
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
 #define DS4_METAL_PROFILE_DECODE_STAGE(name) do { \
+        if (getenv("DS4_PREFILL_TRACE")) { \
+            fprintf(stderr, "ds4: [trace] decode il=%u pos=%u stage=%s ok=%d\n", \
+                    (unsigned)il, (unsigned)pos, (name), (int)ok); \
+            fflush(stderr); \
+        } \
         if (ok && decode_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
