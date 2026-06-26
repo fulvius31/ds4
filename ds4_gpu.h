@@ -1017,6 +1017,25 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* ---- Tensor Parallelism (TP) collectives -----------------------------------
+ * NCCL communicator lifecycle + one sum-all-reduce per layer. Compiled in only
+ * under -DDS4_TP_BUILD (default builds are unaffected); implemented in
+ * ds4_cuda_tp.cu. Host-side mid-dim partition + ncclUniqueId TCP bootstrap are
+ * in ds4_tp.{c,h}.
+ *   ds4_gpu_collective_unique_id - rank 0 mints a 128-byte ncclUniqueId; the
+ *       host broadcasts it (ds4_tp_bootstrap_exchange) before collective_init.
+ *   ds4_gpu_collective_init  - join the NCCL communicator (world_size<=1 = off).
+ *   ds4_gpu_all_reduce_f32   - in-place sum-all-reduce of `count` float32
+ *       elements across ranks, on the default stream.
+ *   ds4_gpu_collective_shutdown - destroy the communicator. */
+#ifdef DS4_TP_BUILD
+int  ds4_gpu_collective_unique_id(void *out_id, uint64_t bytes);
+int  ds4_gpu_collective_init(int world_size, int rank,
+                             const void *bootstrap_id, uint64_t bootstrap_bytes);
+int  ds4_gpu_all_reduce_f32(ds4_gpu_tensor *tensor, uint64_t count);
+void ds4_gpu_collective_shutdown(void);
+#endif /* DS4_TP_BUILD */
+
 #ifdef __cplusplus
 }
 #endif
