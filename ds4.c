@@ -16132,6 +16132,10 @@ static bool metal_graph_encode_decode_layer(
             ds4_gpu_begin_commands();
         }
     }
+    /* Diagnostic/workaround: full device sync per layer to serialize all streams
+     * (drains prefetch + upload + compute). If DS4_CUDA_FORCE_SYNC makes streaming
+     * deterministic+correct, the bug is a cross-stream concurrency race. */
+    if (ok && getenv("DS4_CUDA_FORCE_SYNC")) (void)ds4_gpu_synchronize();
     return ok;
 }
 
