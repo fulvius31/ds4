@@ -10158,6 +10158,14 @@ static void forward_first_token_cpu(
         float *tmp = cur;
         cur = next;
         next = tmp;
+        if (getenv("DS4_LAYER_DUMP")) {
+            const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+            double s = 0.0;
+            for (uint64_t i = 0; i < hc_dim; i++) s += (double)cur[i] * cur[i];
+            fprintf(stderr, "ds4: [dump] CPU il=%u norm=%.6g v0=%.6g v1=%.6g v2=%.6g\n",
+                    il, sqrt(s), cur[0], cur[1], cur[2]);
+            fflush(stderr);
+        }
     }
 
     memcpy(out_hc, cur, (size_t)DS4_N_HC * DS4_N_EMBD * sizeof(out_hc[0]));
@@ -16106,6 +16114,23 @@ static bool metal_graph_encode_decode_layer(
 #undef DS4_METAL_PROFILE_DECODE_STAGE
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
+    }
+    /* Bisection harness: dump token-0 per-layer hidden-state signature for
+     * CPU-vs-GPU comparison (DS4_LAYER_DUMP). Matches the CPU reference dump in
+     * forward_first_token_cpu. Debug-only, gated. */
+    if (ok && pos == 0 && getenv("DS4_LAYER_DUMP")) {
+        if (ds4_gpu_synchronize() != 0) {
+            float *dbuf = (float *)xmalloc((size_t)hc_dim * sizeof(float));
+            if (ds4_gpu_tensor_read(g->after_ffn_hc, 0, dbuf, hc_dim * sizeof(float)) != 0) {
+                double s = 0.0;
+                for (uint64_t i = 0; i < hc_dim; i++) s += (double)dbuf[i] * dbuf[i];
+                fprintf(stderr, "ds4: [dump] GPU il=%u norm=%.6g v0=%.6g v1=%.6g v2=%.6g\n",
+                        il, sqrt(s), dbuf[0], dbuf[1], dbuf[2]);
+                fflush(stderr);
+            }
+            free(dbuf);
+            ds4_gpu_begin_commands();
+        }
     }
     return ok;
 }
