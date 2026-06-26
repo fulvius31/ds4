@@ -14848,6 +14848,49 @@ static bool metal_graph_profile_router_selection(
     return true;
 }
 
+/* Routed MoE for one decode token, with optional Tensor-Parallel mid-dim slicing
+ * + per-layer all-reduce. When TP is enabled each rank computes only its
+ * contiguous slice [mid_start, mid_count) of the expert intermediate dim:
+ * column-parallel gate/up via a row offset into the quantized weights,
+ * row-parallel down via a QK_K-block offset (all per-expert strides stay full;
+ * only the offsets and the mid count change). The partial routed_out is then
+ * sum-all-reduced across ranks. With TP disabled (or default builds) this is a
+ * thin wrapper that passes the full offsets — byte-identical behavior. */
+static bool metal_graph_routed_moe_tp(
+        ds4_gpu_graph *g, const ds4_model *model, const ds4_layer_weights *layer,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint64_t expert_in_dim, uint64_t down_in_dim, uint64_t routed_out_dim,
+        uint32_t il) {
+    uint64_t gate_off = layer->ffn_gate_exps->abs_offset;
+    uint64_t up_off   = layer->ffn_up_exps->abs_offset;
+    uint64_t down_off = layer->ffn_down_exps->abs_offset;
+    uint32_t mid      = (uint32_t)down_in_dim;
+#ifdef DS4_TP_BUILD
+    if (g_ds4_tp.enabled) {
+        gate_off += (uint64_t)g_ds4_tp.mid_start * gate_row_bytes;
+        up_off   += (uint64_t)g_ds4_tp.mid_start * gate_row_bytes;
+        /* exact: mid_start & down_in_dim are multiples of QK_K and down_row_bytes
+         * is (down_in_dim/QK_K)*block, so this is an integer block offset. */
+        down_off += (uint64_t)g_ds4_tp.mid_start * down_row_bytes / down_in_dim;
+        mid       = g_ds4_tp.mid_count;
+    }
+#endif
+    bool ok = ds4_gpu_routed_moe_one_tensor(
+                  g->routed_out, g->routed_gate, g->routed_up, g->routed_mid, g->routed_down,
+                  model->map, model->size, gate_off, up_off, down_off,
+                  layer->ffn_gate_exps->type, layer->ffn_down_exps->type,
+                  gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                  (uint32_t)expert_in_dim, mid, (uint32_t)routed_out_dim,
+                  g->router_selected, g->router_weights,
+                  DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm, il) != 0;
+#ifdef DS4_TP_BUILD
+    if (ok && g_ds4_tp.enabled)
+        ok = ds4_gpu_all_reduce_f32(g->routed_out, DS4_N_EMBD) != 0;
+#endif
+    return ok;
+}
+
 static bool metal_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -15697,26 +15740,10 @@ static bool metal_graph_encode_decode_layer(
                                                shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
-        if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
-                                                     g->routed_gate,
-                                                     g->routed_up,
-                                                     g->routed_mid,
-                                                     g->routed_down,
-                                                     model->map, model->size,
-                                                     layer->ffn_gate_exps->abs_offset,
-                                                     layer->ffn_up_exps->abs_offset,
-                                                     layer->ffn_down_exps->abs_offset,
-                                                     layer->ffn_gate_exps->type,
-                                                     layer->ffn_down_exps->type,
-                                                     gate_expert_bytes, gate_row_bytes,
-                                                     down_expert_bytes, down_row_bytes,
-                                                     (uint32_t)expert_in_dim,
-                                                     (uint32_t)down_in_dim,
-                                                     (uint32_t)routed_out_dim,
-                                                     g->router_selected, g->router_weights,
-                                                     DS4_N_EXPERT,
-                                                     DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
-                                                     il) != 0;
+        if (ok) ok = metal_graph_routed_moe_tp(g, model, layer,
+                                               gate_expert_bytes, gate_row_bytes,
+                                               down_expert_bytes, down_row_bytes,
+                                               expert_in_dim, down_in_dim, routed_out_dim, il);
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
@@ -15870,26 +15897,10 @@ static bool metal_graph_encode_decode_layer(
                             DS4_N_EXPERT_USED) != 0;
             }
         }
-        if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
-                                                     g->routed_gate,
-                                                     g->routed_up,
-                                                     g->routed_mid,
-                                                     g->routed_down,
-                                                     model->map, model->size,
-                                                     layer->ffn_gate_exps->abs_offset,
-                                                     layer->ffn_up_exps->abs_offset,
-                                                     layer->ffn_down_exps->abs_offset,
-                                                     layer->ffn_gate_exps->type,
-                                                     layer->ffn_down_exps->type,
-                                                     gate_expert_bytes, gate_row_bytes,
-                                                     down_expert_bytes, down_row_bytes,
-                                                     (uint32_t)expert_in_dim,
-                                                     (uint32_t)down_in_dim,
-                                                     (uint32_t)routed_out_dim,
-                                                     g->router_selected, g->router_weights,
-                                                     DS4_N_EXPERT,
-                                                     DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
-                                                     il) != 0;
+        if (ok) ok = metal_graph_routed_moe_tp(g, model, layer,
+                                               gate_expert_bytes, gate_row_bytes,
+                                               down_expert_bytes, down_row_bytes,
+                                               expert_in_dim, down_in_dim, routed_out_dim, il);
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
@@ -15954,26 +15965,10 @@ static bool metal_graph_encode_decode_layer(
         }
         return ok;
     }
-    if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
-                                                 g->routed_gate,
-                                                 g->routed_up,
-                                                 g->routed_mid,
-                                                 g->routed_down,
-                                                 model->map, model->size,
-                                                 layer->ffn_gate_exps->abs_offset,
-                                                 layer->ffn_up_exps->abs_offset,
-                                                 layer->ffn_down_exps->abs_offset,
-                                                 layer->ffn_gate_exps->type,
-                                                 layer->ffn_down_exps->type,
-                                                 gate_expert_bytes, gate_row_bytes,
-                                                 down_expert_bytes, down_row_bytes,
-                                                 (uint32_t)expert_in_dim,
-                                                 (uint32_t)down_in_dim,
-                                                 (uint32_t)routed_out_dim,
-                                                 g->router_selected, g->router_weights,
-                                                 DS4_N_EXPERT,
-                                                 DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
-                                                 il) != 0;
+    if (ok) ok = metal_graph_routed_moe_tp(g, model, layer,
+                                           gate_expert_bytes, gate_row_bytes,
+                                           down_expert_bytes, down_row_bytes,
+                                           expert_in_dim, down_in_dim, routed_out_dim, il);
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
