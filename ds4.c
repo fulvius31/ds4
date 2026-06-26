@@ -15578,9 +15578,11 @@ static bool metal_graph_encode_decode_layer(
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     if (ok && metal_graph_decode_cpu_router_applicable(g, layer)) {
         ok = metal_graph_decode_cpu_router(g, model, layer, il, (uint32_t)token);
+        if (getenv("DS4_PREFILL_TRACE")) { fprintf(stderr, "ds4: [trace]   router.cpu ok=%d\n", (int)ok); fflush(stderr); }
     } else {
         if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
                                                      DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
+        if (getenv("DS4_PREFILL_TRACE")) { fprintf(stderr, "ds4: [trace]   router.logits ok=%d\n", (int)ok); fflush(stderr); }
         if (ok) ok = ds4_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
                                                     model->map, model->size,
                                                     layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
@@ -15595,6 +15597,7 @@ static bool metal_graph_encode_decode_layer(
                                                     layer->ffn_exp_probs_b != NULL,
                                                     layer->ffn_gate_tid2eid != NULL,
                                                     g->router_logits) != 0;
+        if (getenv("DS4_PREFILL_TRACE")) { fprintf(stderr, "ds4: [trace]   router.select ok=%d\n", (int)ok); fflush(stderr); }
         if (ok) ok = metal_graph_decode_set_hash_selected_override(model,
                                                                    layer,
                                                                    il,
@@ -15602,6 +15605,7 @@ static bool metal_graph_encode_decode_layer(
                                                                    layer->ffn_gate_exps->bytes,
                                                                    layer->ffn_down_exps->bytes,
                                                                    g);
+        if (getenv("DS4_PREFILL_TRACE")) { fprintf(stderr, "ds4: [trace]   router.hash_override ok=%d\n", (int)ok); fflush(stderr); }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) ok = metal_graph_profile_router_selection(g, layer, il, pos);
