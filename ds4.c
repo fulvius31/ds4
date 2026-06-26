@@ -41,6 +41,9 @@
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+#ifdef DS4_TP_BUILD
+#include "ds4_tp.h"
+#endif
 #endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -247,6 +250,12 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
+
+#ifdef DS4_TP_BUILD
+/* Process-global Tensor Parallelism context (one TP config per ds4 process).
+ * Disabled (mid-dim owned whole) unless DS4_TP_WORLD_SIZE>1. Set at engine open. */
+static ds4_tp_context g_ds4_tp;
+#endif
 
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
@@ -25721,6 +25730,35 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+#ifdef DS4_TP_BUILD
+        /* Tensor parallelism: shard the expert mid-dim (n_ff_exp) across ranks.
+         * align = QK_K = 256 so quantized byte offsets stay block-aligned. Reuses
+         * the NCCL collective + DS4_TP_MASTER_ADDR/PORT TCP bootstrap. */
+        if (ds4_tp_context_from_env(&g_ds4_tp, (uint32_t)g_ds4_shape.n_ff_exp, 256u) == 0 &&
+            g_ds4_tp.enabled) {
+            unsigned char tp_id[128];
+            int tp_ok = 1;
+            if (g_ds4_tp.rank == 0)
+                tp_ok = ds4_gpu_collective_unique_id(tp_id, sizeof tp_id);
+            if (tp_ok && ds4_tp_bootstrap_exchange(g_ds4_tp.world_size, g_ds4_tp.rank,
+                                                   tp_id, tp_id, sizeof tp_id) != 0)
+                tp_ok = 0;
+            if (tp_ok)
+                tp_ok = ds4_gpu_collective_init(g_ds4_tp.world_size, g_ds4_tp.rank,
+                                                tp_id, sizeof tp_id);
+            if (!tp_ok) {
+                fprintf(stderr, "ds4: TP collective init failed (rank %d/%d)\n",
+                        g_ds4_tp.rank, g_ds4_tp.world_size);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            fprintf(stderr, "ds4: TP enabled, rank %d/%d computes expert mid-dim [%u, %u) of %u\n",
+                    g_ds4_tp.rank, g_ds4_tp.world_size,
+                    g_ds4_tp.mid_start, g_ds4_tp.mid_start + g_ds4_tp.mid_count,
+                    g_ds4_tp.mid_dim);
+        }
+#endif
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
         if (!ds4_engine_configure_streaming_auto_cache(e)) {
@@ -26027,6 +26065,9 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->mtp_ready) model_close(&e->mtp_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
+#ifdef DS4_TP_BUILD
+    ds4_gpu_collective_shutdown();
+#endif
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
