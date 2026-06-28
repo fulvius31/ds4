@@ -14,8 +14,11 @@
 # Run it ON THE MASTER Spark (it becomes rank 0); it drives the PEER over SSH.
 # Requires passwordless SSH master -> peer (run: ssh-copy-id <peer> once).
 #
-#   ./spark2_nccl_check.sh <peer-ssh-host>
+#   ./spark2_nccl_check.sh <peer-ssh-host>               # full: detect+install+validate
 #   ./spark2_nccl_check.sh --detect-only                 # just print THIS box's link info
+#   ./spark2_nccl_check.sh --install-only                # install tooling on THIS box only
+#                                                        #   (robust on fresh boxes: run on
+#                                                        #    each, then validate --skip-install)
 #   ./spark2_nccl_check.sh <peer> --skip-install         # tooling already installed
 #   ./spark2_nccl_check.sh <peer> --master-ip 10.0.0.1 --peer-ip 10.0.0.2
 #
@@ -39,10 +42,11 @@ gate_warn() { warn "$*"; WARNS=$((WARNS+1)); }
 gate_bad()  { bad  "$*"; FAILS=$((FAILS+1)); }
 
 # ----- args -----------------------------------------------------------------
-PEER=""; DETECT_ONLY=0; SKIP_INSTALL=0; MIP_OVR=""; PIP_OVR=""
+PEER=""; DETECT_ONLY=0; INSTALL_ONLY=0; SKIP_INSTALL=0; MIP_OVR=""; PIP_OVR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --detect-only) DETECT_ONLY=1 ;;
+    --install-only) INSTALL_ONLY=1 ;;
     --skip-install) SKIP_INSTALL=1 ;;
     --master-ip) MIP_OVR="${2:?}"; shift ;;
     --peer-ip)   PIP_OVR="${2:?}"; shift ;;
@@ -98,6 +102,30 @@ if [ "$DETECT_ONLY" = 1 ]; then
   exit 0
 fi
 
+# tooling install (apt + nccl-tests build). Defined here so --install-only can
+# run it LOCALLY on each box (avoids fragile sudo-over-SSH on a fresh install).
+INSTALL_SNIPPET='
+  set -e
+  export DEBIAN_FRONTEND=noninteractive
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq perftest ibverbs-utils infiniband-diags rdma-core \
+       libnccl2 libnccl-dev libopenmpi-dev openmpi-bin build-essential git iproute2
+  if [ ! -x "$HOME/nccl-tests/build/all_reduce_perf" ]; then
+    [ -d "$HOME/nccl-tests" ] || git clone --depth 1 https://github.com/NVIDIA/nccl-tests "$HOME/nccl-tests"
+    MPI_HOME=/usr/lib/$(uname -m)-linux-gnu/openmpi
+    make -C "$HOME/nccl-tests" MPI=1 MPI_HOME="$MPI_HOME" NCCL_HOME=/usr -j"$(nproc)" >/tmp/ncclt_build.log 2>&1 \
+      || { echo "nccl-tests build FAILED:"; tail -20 /tmp/ncclt_build.log; exit 1; }
+  fi
+  echo "install-ok $(hostname)"
+'
+if [ "$INSTALL_ONLY" = 1 ]; then
+  hdr "Installing tooling + building nccl-tests on this box ($(hostname))"
+  printf '%s' "$INSTALL_SNIPPET" | bash 2>&1 | sed "s/^/  /" || die "install failed"
+  ok "tooling ready on $(hostname). Run --install-only on the OTHER box too, then from the master:"
+  say "    ./tools/spark2_nccl_check.sh <peer-ip> --skip-install"
+  exit 0
+fi
+
 [ -n "$PEER" ] || die "give the peer's SSH host as the first arg (or use --detect-only). e.g. ./spark2_nccl_check.sh 10.0.0.2"
 ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" true 2>/dev/null \
   || die "passwordless SSH to '$PEER' failed. Run:  ssh-copy-id $PEER"
@@ -117,25 +145,13 @@ fi
 SUBNET=$(net30 "$MIP")
 say "  link subnet: ${BLD}$SUBNET${RST}   (rank0=$MIP via $MDEV, rank1=$PIP via $PDEV)"
 
-# ----- INSTALL --------------------------------------------------------------
-INSTALL_SNIPPET='
-  set -e
-  export DEBIAN_FRONTEND=noninteractive
-  sudo apt-get update -qq
-  sudo apt-get install -y -qq perftest ibverbs-utils infiniband-diags rdma-core \
-       libnccl2 libnccl-dev libopenmpi-dev openmpi-bin build-essential git iproute2
-  if [ ! -x "$HOME/nccl-tests/build/all_reduce_perf" ]; then
-    [ -d "$HOME/nccl-tests" ] || git clone --depth 1 https://github.com/NVIDIA/nccl-tests "$HOME/nccl-tests"
-    MPI_HOME=/usr/lib/$(uname -m)-linux-gnu/openmpi
-    make -C "$HOME/nccl-tests" MPI=1 MPI_HOME="$MPI_HOME" NCCL_HOME=/usr -j"$(nproc)" >/tmp/ncclt_build.log 2>&1 \
-      || { echo "nccl-tests build FAILED:"; tail -20 /tmp/ncclt_build.log; exit 1; }
-  fi
-  echo "install-ok $(hostname)"
-'
+# ----- INSTALL (over SSH; needs passwordless sudo on the peer. If sudo prompts,
+#       use --install-only on EACH box first, then validate here --skip-install) -
 if [ "$SKIP_INSTALL" = 0 ]; then
   hdr "Installing tooling + building nccl-tests (this box + peer)"
   printf '%s' "$INSTALL_SNIPPET" | bash 2>&1 | sed "s/^/  [local] /" || die "local install failed"
-  printf '%s' "$INSTALL_SNIPPET" | ssh "$PEER" bash 2>&1 | sed "s/^/  [peer ] /" || die "peer install failed"
+  printf '%s' "$INSTALL_SNIPPET" | ssh "$PEER" bash 2>&1 | sed "s/^/  [peer ] /" \
+    || die "peer install failed (sudo over SSH?) — run '--install-only' on $PEER, then re-run with --skip-install"
   ok "tooling ready on both boxes"
 else
   warn "skipping install (--skip-install)"
