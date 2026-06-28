@@ -93,6 +93,16 @@ help:
 cuda-spark:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
 
+# CUDA Graphs experimental build (DGX Spark / GB10). Identical to cuda-spark
+# except kernels are compiled onto the per-thread default stream (capturable by
+# CUDA graphs) and the DS4_CUDA_GRAPH code paths are enabled. Graph capture is
+# additionally gated at runtime by the DS4_CUDA_GRAPH=1 env var. See
+# CUDA_GRAPH_PLAN.md. Stage 1: build foundation only (no capture yet) — must be
+# numerically identical to cuda-spark before later stages add capture.
+cuda-spark-graph:
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH= \
+		NVCCFLAGS="$(NVCCFLAGS) --default-stream per-thread -DDS4_CUDA_GRAPH"
+
 cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
 
