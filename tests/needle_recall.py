@@ -290,7 +290,10 @@ def main() -> int:
                 ctx=ctx, depth=depth, expected=digit_str, passed=passed,
                 latency_s=round(secs, 1), approx_tok=approx_tok, got_tail=tail)
             status = "PASS" if passed else ("ERR" if out.startswith("<") else "FAIL")
-            print(f"      -> {status}  ({secs:.1f}s)  expected={digit_str}")
+            if status == "ERR":
+                print(f"      -> ERR  ({secs:.1f}s)  {tail.strip()[:240]}")
+            else:
+                print(f"      -> {status}  ({secs:.1f}s)  expected={digit_str}")
             if not args.keep_prompts and not args.dry_run:
                 ppath.unlink(missing_ok=True)
 
