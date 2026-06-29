@@ -213,7 +213,10 @@ def main() -> int:
             ppath.write_text(prompt, encoding="utf-8")
             approx_tok = int(len(prompt) / args.chars_per_token)
 
-            if args.calibrate and not args.dry_run:
+            # Calibration only tokenizes (`ds4 --dump-tokens`); it is independent
+            # of --dry-run, which only skips the generation pass. So
+            # `--calibrate --dry-run` = "report real token counts, don't generate".
+            if args.calibrate:
                 try:
                     dt = subprocess.run(
                         [args.bin, "-m", args.model, f"--{args.backend}",
