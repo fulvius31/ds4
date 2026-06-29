@@ -237,6 +237,10 @@ def main() -> int:
                     help="run `ds4 --dump-tokens` on each prompt to report real token counts")
     ap.add_argument("--dry-run", action="store_true",
                     help="generate prompts + print commands, don't run ds4")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="independent needles (different code/position) per cell; "
+                         "grid then shows a recall RATE k/n instead of PASS/FAIL. "
+                         "Use >1 to characterize probabilistic recall at long ctx")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -244,61 +248,70 @@ def main() -> int:
     ctx_list = [int(x) for x in args.ctx_list.split(",") if x.strip()]
     depths = [float(x) for x in args.depths.split(",") if x.strip()]
 
-    results = {}  # (ctx, depth) -> dict
+    results = {}   # (ctx, depth) -> {"passes":k, "total":n, "err":bool}
+    all_rows = []  # flat per-trial rows for the CSV
     rng = random.Random(args.seed)
 
     for ctx in ctx_list:
         for depth in depths:
-            prompt, digit_str, spelled_str = build_haystack(
-                rng, ctx, depth, args.chars_per_token, args.ndigits)
-            ppath = out_dir / f"prompt_ctx{ctx}_d{depth:.2f}.txt"
-            ppath.write_text(prompt, encoding="utf-8")
-            approx_tok = int(len(prompt) / args.chars_per_token)
+            passes = 0
+            err_count = 0
+            for trial in range(args.repeats):
+                prompt, digit_str, spelled_str = build_haystack(
+                    rng, ctx, depth, args.chars_per_token, args.ndigits)
+                ppath = out_dir / f"prompt_ctx{ctx}_d{depth:.2f}_t{trial}.txt"
+                ppath.write_text(prompt, encoding="utf-8")
+                approx_tok = int(len(prompt) / args.chars_per_token)
 
-            # Calibration only tokenizes (`ds4 --dump-tokens`); it is independent
-            # of --dry-run, which only skips the generation pass. So
-            # `--calibrate --dry-run` = "report real token counts, don't generate".
-            if args.calibrate:
-                try:
-                    dt = subprocess.run(
-                        [args.bin, "-m", args.model, f"--{args.backend}",
-                         "--dump-tokens", "--prompt-file", str(ppath)],
-                        capture_output=True, text=True, timeout=600)
-                    ntok = parse_token_count(dt.stdout + dt.stderr)
-                    if ntok:
-                        cpt = len(prompt) / ntok
-                        cal = (f"real_tokens={ntok}  chars/token={cpt:.2f}  "
-                               f"-> set --chars-per-token {cpt:.2f}")
-                    else:
-                        cal = "(could not parse --dump-tokens output)"
-                except Exception as e:  # noqa: BLE001
-                    cal = f"(calibrate failed: {e})"
-                print(f"[calibrate] target_ctx={ctx} d{depth:.2f}: bytes={len(prompt)} "
-                      f"approx_tok={approx_tok} :: {cal}")
+                # Calibration only tokenizes (`ds4 --dump-tokens`); independent of
+                # --dry-run. Same size every trial, so only do it once per cell.
+                if args.calibrate and trial == 0:
+                    try:
+                        dt = subprocess.run(
+                            [args.bin, "-m", args.model, f"--{args.backend}",
+                             "--dump-tokens", "--prompt-file", str(ppath)],
+                            capture_output=True, text=True, timeout=600)
+                        ntok = parse_token_count(dt.stdout + dt.stderr)
+                        if ntok:
+                            cpt = len(prompt) / ntok
+                            cal = (f"real_tokens={ntok}  chars/token={cpt:.2f}  "
+                                   f"-> set --chars-per-token {cpt:.2f}")
+                        else:
+                            cal = "(could not parse --dump-tokens output)"
+                    except Exception as e:  # noqa: BLE001
+                        cal = f"(calibrate failed: {e})"
+                    print(f"[calibrate] target_ctx={ctx} d{depth:.2f}: bytes={len(prompt)} "
+                          f"approx_tok={approx_tok} :: {cal}")
 
-            print(f"[run] ctx={ctx} depth={depth:.2f} (approx {approx_tok} tok) ...",
-                  flush=True)
-            out, secs = run_case(args, ppath, ctx)
-            # Defend against prompt echo: remove the verbatim haystack from the
-            # output so the spelled needle in the haystack can't false-pass.
-            # (The digit form is already echo-safe -- digits never appear in the
-            # haystack, only the spelled code does.)
-            clean = out.replace(prompt, " ") if out and not out.startswith("<") else out
-            passed = score(clean, digit_str, spelled_str) if clean and not clean.startswith("<") else False
-            tail = clean[-400:].replace("\n", " ⏎ ") if clean else ""
-            results[(ctx, depth)] = dict(
-                ctx=ctx, depth=depth, expected=digit_str, passed=passed,
-                latency_s=round(secs, 1), approx_tok=approx_tok, got_tail=tail)
-            status = "PASS" if passed else ("ERR" if out.startswith("<") else "FAIL")
-            if status == "ERR":
-                print(f"      -> ERR  ({secs:.1f}s)  {tail.strip()[:240]}")
-            else:
-                print(f"      -> {status}  ({secs:.1f}s)  expected={digit_str}")
-            if not args.keep_prompts and not args.dry_run:
-                ppath.unlink(missing_ok=True)
+                tag = f"ctx={ctx} depth={depth:.2f}"
+                if args.repeats > 1:
+                    tag += f" trial={trial + 1}/{args.repeats}"
+                print(f"[run] {tag} (approx {approx_tok} tok) ...", flush=True)
+                out, secs = run_case(args, ppath, ctx)
+                # Defend against prompt echo: remove the verbatim haystack so the
+                # spelled needle in the haystack can't false-pass. (Digit form is
+                # already echo-safe -- digits never appear in the haystack.)
+                clean = out.replace(prompt, " ") if out and not out.startswith("<") else out
+                passed = score(clean, digit_str, spelled_str) if clean and not clean.startswith("<") else False
+                tail = clean[-400:].replace("\n", " ⏎ ") if clean else ""
+                status = "PASS" if passed else ("ERR" if out.startswith("<") else "FAIL")
+                if status == "ERR":
+                    print(f"      -> ERR  ({secs:.1f}s)  {tail.strip()[:240]}")
+                    err_count += 1
+                else:
+                    print(f"      -> {status}  ({secs:.1f}s)  expected={digit_str}")
+                passes += int(passed)
+                all_rows.append(dict(
+                    ctx=ctx, depth=depth, trial=trial, approx_tok=approx_tok,
+                    expected=digit_str, passed=passed, status=status,
+                    latency_s=round(secs, 1), got_tail=tail))
+                if not args.keep_prompts and not args.dry_run:
+                    ppath.unlink(missing_ok=True)
+            results[(ctx, depth)] = dict(passes=passes, total=args.repeats,
+                                         err=(err_count == args.repeats))
 
-    # ---- grid ----
-    print("\n=== Needle recall grid (rows=depth, cols=ctx) ===")
+    # ---- grid (cells show recall rate k/n, or ERR if every trial errored) ----
+    print("\n=== Needle recall grid (rows=depth, cols=ctx; cell = passes/trials) ===")
     header = "depth\\ctx |" + "".join(f"{c:>10}" for c in ctx_list)
     print(header)
     print("-" * len(header))
@@ -306,17 +319,18 @@ def main() -> int:
         row = f"{d:>9.2f} |"
         for c in ctx_list:
             r = results[(c, d)]
-            cell = "PASS" if r["passed"] else ("ERR" if r["got_tail"].startswith("<") else "FAIL")
+            cell = "ERR" if r["err"] else f"{r['passes']}/{r['total']}"
             row += f"{cell:>10}"
         print(row)
 
-    # ---- csv ----
+    # ---- csv (one row per trial) ----
     csv_path = out_dir / "needle_results.csv"
     with csv_path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["ctx", "depth", "approx_tok", "expected",
-                                          "passed", "latency_s", "got_tail"])
+        w = csv.DictWriter(f, fieldnames=["ctx", "depth", "trial", "approx_tok",
+                                          "expected", "passed", "status",
+                                          "latency_s", "got_tail"])
         w.writeheader()
-        for r in results.values():
+        for r in all_rows:
             w.writerow(r)
     print(f"\nWrote {csv_path}")
     return 0
