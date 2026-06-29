@@ -166,7 +166,11 @@ def run_case(args, prompt_path: Path, ctx: int) -> tuple[str, float]:
     cmd = [
         args.bin, "-m", args.model, f"--{args.backend}",
         "--temp", "0",
-        "-c", str(ctx + args.gen_tokens + 4096),
+        # -c must exceed the REAL prompt token count. Our token estimate drifts
+        # ~1% from the real tokenizer at scale, so a fixed +4096 margin gets eaten
+        # at large ctx (e.g. a 524288 target tokenized to 528452 > 528432 and was
+        # wrongly rejected as "exceeds context size"). Use a proportional margin.
+        "-c", str(ctx + max(8192, ctx // 20) + args.gen_tokens),
         "-n", str(args.gen_tokens),
         "--system", "",
         "--think" if args.think else "--nothink",
