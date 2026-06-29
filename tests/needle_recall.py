@@ -198,8 +198,10 @@ def main() -> int:
                     help="comma-separated needle depths (0..1)")
     ap.add_argument("-n", "--gen-tokens", type=int, default=48)
     ap.add_argument("--ndigits", type=int, default=6, help="needle code length")
-    ap.add_argument("--chars-per-token", type=float, default=3.8,
-                    help="filler sizing heuristic (bytes/token); tune with --calibrate")
+    ap.add_argument("--chars-per-token", type=float, default=4.5,
+                    help="filler sizing heuristic (bytes/token). Default 4.5 is "
+                         "calibrated for DeepSeek V4's tokenizer on this prose "
+                         "(~4.49 measured); re-check with --calibrate for other corpora")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--think", action="store_true", help="allow thinking (default off)")
     ap.add_argument("--timeout", type=int, default=5400, help="per-case seconds")
