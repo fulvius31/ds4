@@ -164,13 +164,17 @@ def parse_token_count(text: str) -> int:
 def run_case(args, prompt_path: Path, ctx: int) -> tuple[str, float]:
     cmd = [
         args.bin, "-m", args.model, f"--{args.backend}",
-        "--temp", "0", "--seed", str(args.seed),
+        "--temp", "0",
         "-c", str(ctx + args.gen_tokens + 4096),
         "-n", str(args.gen_tokens),
         "--system", "",
         "--think" if args.think else "--nothink",
-        "--prompt-file", str(prompt_path),
     ]
+    # ds4 rejects `--seed 0` (0 is its parse-failure sentinel); with --temp 0
+    # (greedy) the output is deterministic anyway, so only pass a nonzero seed.
+    if args.seed:
+        cmd += ["--seed", str(args.seed)]
+    cmd += ["--prompt-file", str(prompt_path)]
     if args.dry_run:
         print("  DRY-RUN:", " ".join(cmd))
         return "", 0.0
@@ -178,12 +182,15 @@ def run_case(args, prompt_path: Path, ctx: int) -> tuple[str, float]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=args.timeout)
-        out = proc.stdout + "\n" + proc.stderr
     except subprocess.TimeoutExpired:
         return "<TIMEOUT>", time.time() - t0
     except Exception as e:  # noqa: BLE001
         return f"<ERROR: {e}>", time.time() - t0
-    return out, time.time() - t0
+    if proc.returncode != 0:
+        errlines = [l for l in proc.stderr.splitlines() if l.strip()]
+        msg = errlines[-1] if errlines else f"exit {proc.returncode}"
+        return f"<EXIT {proc.returncode}: {msg}>", time.time() - t0
+    return proc.stdout + "\n" + proc.stderr, time.time() - t0
 
 
 def main() -> int:
@@ -202,7 +209,9 @@ def main() -> int:
                     help="filler sizing heuristic (bytes/token). Default 4.5 is "
                          "calibrated for DeepSeek V4's tokenizer on this prose "
                          "(~4.49 measured); re-check with --calibrate for other corpora")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="RNG seed; 0 = omit (ds4 rejects --seed 0, and greedy "
+                         "temp=0 is deterministic regardless)")
     ap.add_argument("--think", action="store_true", help="allow thinking (default off)")
     ap.add_argument("--timeout", type=int, default=5400, help="per-case seconds")
     ap.add_argument("--out-dir", default="needle_runs")
