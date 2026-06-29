@@ -147,6 +147,20 @@ def score(output: str, digit_str: str, spelled_str: str) -> bool:
     return False
 
 
+def parse_token_count(text: str) -> int:
+    """Parse `ds4 --dump-tokens` output.
+
+    It prints the token-id array as a single line `[id, id, id, ...]` followed by
+    one `   id  <text>` line per token. Count from the bracket line; fall back to
+    counting the per-token detail lines.
+    """
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            return 0 if s == "[]" else s.count(",") + 1
+    return sum(1 for l in text.splitlines() if re.match(r"^\s*\d+\s+\S", l))
+
+
 def run_case(args, prompt_path: Path, ctx: int) -> tuple[str, float]:
     cmd = [
         args.bin, "-m", args.model, f"--{args.backend}",
@@ -222,12 +236,16 @@ def main() -> int:
                         [args.bin, "-m", args.model, f"--{args.backend}",
                          "--dump-tokens", "--prompt-file", str(ppath)],
                         capture_output=True, text=True, timeout=600)
-                    tokln = [l for l in (dt.stdout + dt.stderr).splitlines()
-                             if "token" in l.lower()]
-                    cal = tokln[-1] if tokln else "(no token line)"
+                    ntok = parse_token_count(dt.stdout + dt.stderr)
+                    if ntok:
+                        cpt = len(prompt) / ntok
+                        cal = (f"real_tokens={ntok}  chars/token={cpt:.2f}  "
+                               f"-> set --chars-per-token {cpt:.2f}")
+                    else:
+                        cal = "(could not parse --dump-tokens output)"
                 except Exception as e:  # noqa: BLE001
                     cal = f"(calibrate failed: {e})"
-                print(f"[calibrate] ctx~{ctx} d{depth:.2f}: bytes={len(prompt)} "
+                print(f"[calibrate] target_ctx={ctx} d{depth:.2f}: bytes={len(prompt)} "
                       f"approx_tok={approx_tok} :: {cal}")
 
             print(f"[run] ctx={ctx} depth={depth:.2f} (approx {approx_tok} tok) ...",
