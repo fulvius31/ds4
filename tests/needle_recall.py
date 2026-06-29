@@ -35,6 +35,7 @@ import argparse
 import csv
 import random
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -174,6 +175,14 @@ def run_case(args, prompt_path: Path, ctx: int) -> tuple[str, float]:
     # (greedy) the output is deterministic anyway, so only pass a nonzero seed.
     if args.seed:
         cmd += ["--seed", str(args.seed)]
+    # Large contexts (>256k) can exceed a single 128GB Spark's unified memory for
+    # weights + KV/context buffers; SSD streaming spills to disk to get there.
+    if args.ssd_streaming:
+        cmd += ["--ssd-streaming"]
+        if args.ssd_cache_experts:
+            cmd += ["--ssd-streaming-cache-experts", args.ssd_cache_experts]
+    if args.extra:
+        cmd += shlex.split(args.extra)
     cmd += ["--prompt-file", str(prompt_path)]
     if args.dry_run:
         print("  DRY-RUN:", " ".join(cmd))
@@ -213,6 +222,14 @@ def main() -> int:
                     help="RNG seed; 0 = omit (ds4 rejects --seed 0, and greedy "
                          "temp=0 is deterministic regardless)")
     ap.add_argument("--think", action="store_true", help="allow thinking (default off)")
+    ap.add_argument("--ssd-streaming", action="store_true",
+                    help="pass --ssd-streaming to ds4 (needed for very large ctx that "
+                         "exceeds unified memory on one Spark)")
+    ap.add_argument("--ssd-cache-experts", default="",
+                    help="value for ds4 --ssd-streaming-cache-experts, e.g. 16GB")
+    ap.add_argument("--extra", default="",
+                    help="extra args appended verbatim to the ds4 command line "
+                         "(shlex-split), e.g. --extra '--prefill-chunk 2048'")
     ap.add_argument("--timeout", type=int, default=5400, help="per-case seconds")
     ap.add_argument("--out-dir", default="needle_runs")
     ap.add_argument("--keep-prompts", action="store_true")
