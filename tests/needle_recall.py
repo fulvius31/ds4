@@ -191,10 +191,14 @@ def run_case(args, prompt_path: Path, ctx: int) -> tuple[str, float]:
     if args.dry_run:
         print("  DRY-RUN:", " ".join(cmd))
         return "", 0.0
+    # Prefill is O(context); at ~150 t/s a 1M prompt needs ~2 hrs. Auto-scale the
+    # per-cell timeout with ctx (floored by --timeout) so big cells don't get
+    # killed mid-prefill. ctx//50 ≈ assumes >=50 tok/s combined, generous.
+    eff_timeout = max(args.timeout, ctx // 50)
     t0 = time.time()
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=args.timeout)
+                              timeout=eff_timeout)
     except subprocess.TimeoutExpired:
         return "<TIMEOUT>", time.time() - t0
     except Exception as e:  # noqa: BLE001
@@ -234,7 +238,9 @@ def main() -> int:
     ap.add_argument("--extra", default="",
                     help="extra args appended verbatim to the ds4 command line "
                          "(shlex-split), e.g. --extra '--prefill-chunk 2048'")
-    ap.add_argument("--timeout", type=int, default=5400, help="per-case seconds")
+    ap.add_argument("--timeout", type=int, default=5400,
+                    help="per-case seconds (floor); auto-scales up with ctx (ctx//50) "
+                         "so large contexts aren't killed mid-prefill")
     ap.add_argument("--out-dir", default="needle_runs")
     ap.add_argument("--keep-prompts", action="store_true")
     ap.add_argument("--calibrate", action="store_true",
