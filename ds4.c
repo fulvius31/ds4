@@ -42740,6 +42740,16 @@ static bool glm_graph_encode_ffn_batch(
                 gate_out * gate_row_bytes,
                 down_out * down_row_bytes);
     }
+    metal_graph_debug_dump_i32_tensor("glm_ffn_batch_router_selected",
+                                      g->batch_router_selected,
+                                      (uint64_t)n_tokens * DS4_N_EXPERT_USED,
+                                      il,
+                                      0);
+    metal_graph_debug_dump_tensor("glm_ffn_batch_router_weights",
+                                  g->batch_router_weights,
+                                  (uint64_t)n_tokens * DS4_N_EXPERT_USED,
+                                  il,
+                                  0);
     if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) { /* ablate: keep the gate */ } else
     if (ok) ok = glm_graph_routed_moe_batch_dispatch(
             g,
@@ -42765,6 +42775,11 @@ static bool glm_graph_encode_ffn_batch(
         ok = glm_graph_tp_batch_ffn_combine(g, il, g->batch_ffn_out, n_tokens);
         if (!ok) fprintf(stderr, "ds4: GLM TP batch gate failed (layer %u)\n", il);
     }
+    metal_graph_debug_dump_tensor("glm_ffn_batch_routed_out",
+                                  g->batch_ffn_out,
+                                  (uint64_t)n_tokens * DS4_N_EMBD,
+                                  il,
+                                  0);
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
                                                   stage_sync,
                                                   "glm_ffn",
