@@ -6,11 +6,11 @@ MODEL=gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf
 cd "$(dirname "$0")"
 # See run_glm_worker.sh: default 32 GiB guard reserve does not fit a 121 GiB Spark.
 export DS4_GLM_MEMORY_GUARD_RESERVE_GB=12
-# -c 2048: larger contexts push the 0:40 slice past the ~104 GiB
+# -c "${GLM_CTX:-12288}": larger contexts push the 0:40 slice past the ~104 GiB
 # planned-footprint ceiling of a 121 GiB Spark.
 exec ./ds4 -m "$MODEL" --cuda \
   --role coordinator \
-  --layers 0:40 \
+  --layers 0:39 \
   --listen 10.0.0.1 9911 \
-  -c 2048 \
+  -c "${GLM_CTX:-12288}" \
   "$@"

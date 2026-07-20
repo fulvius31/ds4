@@ -11,6 +11,6 @@ cd "$(dirname "$0")"
 export DS4_GLM_MEMORY_GUARD_RESERVE_GB=12
 exec ./ds4 -m "$MODEL" --cuda \
   --role worker \
-  --layers 41:output \
-  -c 8192 \
+  --layers 40:output \
+  -c "${GLM_CTX:-12288}" \
   --coordinator 10.0.0.1 9911
