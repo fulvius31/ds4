@@ -413,7 +413,10 @@ static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
 #ifdef DS4_ROCM_BUILD
     if (backend == DS4_BACKEND_CUDA) return true;
 #else
-    (void)backend;
+    /* Plain CUDA builds share the HIP/ROCm streaming implementation;
+     * experimental opt-in until validated (tested on DGX Spark GB10). */
+    if (backend == DS4_BACKEND_CUDA &&
+        getenv("DS4_GLM_CUDA_STREAMING") != NULL) return true;
 #endif
     return false;
 }
@@ -423,7 +426,8 @@ static bool ds4_backend_supports_glm_streaming_full_layers(ds4_backend backend) 
 #ifdef DS4_ROCM_BUILD
     if (backend == DS4_BACKEND_CUDA) return true;
 #else
-    (void)backend;
+    if (backend == DS4_BACKEND_CUDA &&
+        getenv("DS4_GLM_CUDA_STREAMING") != NULL) return true;
 #endif
     return false;
 }
