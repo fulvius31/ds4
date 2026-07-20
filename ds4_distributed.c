@@ -2957,6 +2957,9 @@ static int dist_coordinator_rebuild_from_transcript(
         bool forget_route,
         char *err,
         size_t errlen) {
+    fprintf(stderr,
+            "ds4: distributed coordinator: rebuild after error: %s\n",
+            err && err[0] ? err : "(no message)");
     DIST_COORD_DEBUG(state,
                      "ds4: distributed coordinator: replaying %d tokens after distributed %s\n",
                      transcript->len,

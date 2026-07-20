@@ -34400,8 +34400,16 @@ static bool glm_graph_expanded_kv_cache_enabled(bool ssd_streaming) {
     return false;
 }
 
+/* A distributed layer slice may start at a selection-reuse layer, whose
+ * indexer selection would live on the previous machine. Every layer carries
+ * indexer weights, so the slice's first layer is promoted to a full-indexer
+ * (recompute) layer instead. Only that boundary layer's sparse-attention
+ * token selection differs from single-machine execution. */
+static uint32_t g_glm_slice_forced_indexer_layer = UINT32_MAX;
+
 static bool glm_graph_layer_uses_full_indexer(uint32_t il) {
     if (il < DS4_N_LEADING_DENSE) return true;
+    if (il == g_glm_slice_forced_indexer_layer) return true;
     return il >= 6u && ((il - 6u) % 4u) == 0u;
 }
 
@@ -38439,6 +38447,14 @@ static bool glm_graph_validate_layout(
     g->layer_start = layer_start;
     g->layer_end = layer_end;
     g->layer_count = layer_end - layer_start + 1u;
+    if (layer_start >= DS4_N_LEADING_DENSE &&
+        !(layer_start >= 6u && ((layer_start - 6u) % 4u) == 0u)) {
+        g_glm_slice_forced_indexer_layer = layer_start;
+        fprintf(stderr,
+                "ds4: GLM layer slice starts at selection-reuse layer %u; "
+                "promoting it to a full-indexer layer\n",
+                layer_start);
+    }
     g->q_dim = (uint64_t)DS4_N_HEAD * DS4_N_KEY_MLA;
     g->q_nope = (uint64_t)DS4_N_KEY_MLA - DS4_N_ROT;
     g->heads_dim = (uint64_t)DS4_N_HEAD * DS4_N_VALUE_MLA;
