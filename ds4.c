@@ -40427,6 +40427,37 @@ static int glm_graph_routed_moe_batch_dispatch(
             l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             return 0;
         }
+        /* Large chunks: dequant + per-expert GEMM runs on tensor cores and
+         * is ~10x the per-pair dot kernels; fall through on any failure. */
+        if (n_tokens >= 128u &&
+            l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS &&
+            getenv("DS4_GLM_NO_MOE_GEMM") == NULL &&
+            ds4_gpu_glm_routed_moe_batch_gemm_tensor(
+                    out,
+                    g->batch_routed_down,
+                    model->map,
+                    model->size,
+                    l->ffn_gate_exps->abs_offset,
+                    l->ffn_up_exps->abs_offset,
+                    l->ffn_down_exps->abs_offset,
+                    gate_expert_bytes,
+                    gate_row_bytes,
+                    up_expert_bytes,
+                    up_row_bytes,
+                    down_expert_bytes,
+                    down_row_bytes,
+                    DS4_N_EMBD,
+                    DS4_N_FF_EXP,
+                    DS4_N_EMBD,
+                    selected,
+                    weights,
+                    DS4_N_EXPERT,
+                    DS4_N_EXPERT_USED,
+                    il,
+                    x,
+                    n_tokens) != 0) {
+            return 1;
+        }
         return ds4_gpu_routed_moe_batch_tensor(out,
                                                g->batch_routed_gate,
                                                g->batch_routed_up,
