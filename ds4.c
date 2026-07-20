@@ -40223,6 +40223,31 @@ static bool glm_graph_prefill_stage_boundary(
     return true;
 }
 
+/* Measurement aid: append router expert selections to a binary log
+ * (records: u32 layer, u32 n_tokens, n_tokens*DS4_N_EXPERT_USED i32 ids).
+ * Costs a device sync per MoE layer; only for offline cache analysis. */
+static void glm_debug_log_selected(uint32_t il,
+                                   const ds4_gpu_tensor *selected,
+                                   uint32_t n_tokens) {
+    const char *path = getenv("DS4_GLM_SELECTION_LOG");
+    if (!path || !path[0] || !selected || n_tokens == 0) return;
+    static FILE *f = NULL;
+    if (!f) {
+        f = fopen(path, "ab");
+        if (!f) return;
+    }
+    const size_t n = (size_t)n_tokens * DS4_N_EXPERT_USED;
+    int32_t *buf = xmalloc(n * sizeof(int32_t));
+    if (ds4_gpu_tensor_read((ds4_gpu_tensor *)selected, 0, buf,
+                            n * sizeof(int32_t))) {
+        const uint32_t hdr[2] = { il, n_tokens };
+        fwrite(hdr, sizeof(hdr), 1, f);
+        fwrite(buf, sizeof(int32_t), n, f);
+        fflush(f);
+    }
+    free(buf);
+}
+
 static int glm_graph_routed_moe_one_dispatch(
         const ds4_glm_gpu_graph *g,
         const ds4_model         *model,
@@ -40241,6 +40266,7 @@ static int glm_graph_routed_moe_one_dispatch(
         const ds4_gpu_tensor    *x,
         bool                     force_resident) {
     if (!g || !model || !l) return 0;
+    glm_debug_log_selected(il, selected, 1u);
     /* Under the TP expert split only the ownership-aware kernels may run:
      * the generic mul_mv_id family and the GLM q2_K resident pair/down.
      * Anything else would silently compute the full expert set. */
@@ -40393,6 +40419,7 @@ static int glm_graph_routed_moe_batch_dispatch(
         bool                     force_resident,
         bool                     direct_scalar_q4) {
     if (!g || !model || !l) return 0;
+    glm_debug_log_selected(il, selected, n_tokens);
     g->batch_routed_mid_is_f16 = false;
 
     if (glm_graph_layer_uses_generic_routed_moe(l)) {
@@ -41909,6 +41936,75 @@ static bool glm_graph_seed_streaming_expert_cache_from_full_layer(
 
 static bool glm_graph_disable_add3_residual(void);
 
+/* CUDA streaming: stage the chunk's selected experts before the batch
+ * routed-MoE kernels run. The CUDA backend serves batch routed matmuls
+ * from the per-layer selected-expert cache whenever SSD streaming is
+ * active (it ignores the resident-layer hint), so every routed layer of
+ * a batch chunk must be staged or routed_moe_launch rejects the layer.
+ * Mirrors metal_graph_cuda_stream_prefill_batch_selected_load, with the
+ * GLM expert table (gate/up/down all present). */
+static bool glm_graph_cuda_stream_prefill_batch_selected_load(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 il,
+        uint32_t                 n_tokens,
+        uint64_t                 gate_expert_bytes,
+        uint64_t                 down_expert_bytes) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (!g || !model || !l || n_tokens <= 1 ||
+        !g->ssd_streaming ||
+        !g->batch_router_selected ||
+        !glm_graph_layer_uses_generic_routed_moe(l) ||
+        DS4_N_EXPERT == 0 || DS4_N_EXPERT_USED == 0) {
+        return true;
+    }
+    const uint64_t n_ids64 = (uint64_t)n_tokens * DS4_N_EXPERT_USED;
+    if (n_ids64 > UINT32_MAX || n_ids64 > SIZE_MAX / sizeof(int32_t)) {
+        fprintf(stderr,
+                "ds4: GLM streaming prefill selected-id count overflow at layer %u\n",
+                il);
+        return false;
+    }
+    if (ds4_gpu_end_commands() == 0) return false;
+    int32_t *selected_ids = xmalloc((size_t)n_ids64 * sizeof(selected_ids[0]));
+    bool ok = ds4_gpu_tensor_read(g->batch_router_selected,
+                                  0,
+                                  selected_ids,
+                                  n_ids64 * sizeof(selected_ids[0])) != 0;
+    if (ok) {
+        const ds4_gpu_stream_expert_table table = {
+            .model_map = model->map,
+            .model_size = model->size,
+            .layer = il,
+            .n_total_expert = DS4_N_EXPERT,
+            .gate_offset = l->ffn_gate_exps->abs_offset,
+            .up_offset = l->ffn_up_exps->abs_offset,
+            .down_offset = l->ffn_down_exps->abs_offset,
+            .gate_expert_bytes = gate_expert_bytes,
+            .down_expert_bytes = down_expert_bytes,
+        };
+        ok = ds4_gpu_stream_expert_cache_prepare_selected_batch(
+                    &table,
+                    selected_ids,
+                    n_tokens,
+                    DS4_N_EXPERT_USED) != 0;
+        if (!ok) {
+            fprintf(stderr,
+                    "ds4: GLM streaming prefill selected-expert staging failed at layer %u\n",
+                    il);
+        }
+    }
+    free(selected_ids);
+    if (ds4_gpu_begin_commands() == 0) ok = false;
+    return ok;
+#else
+    (void)g; (void)model; (void)l; (void)il; (void)n_tokens;
+    (void)gate_expert_bytes; (void)down_expert_bytes;
+    return true;
+#endif
+}
+
 static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -42040,6 +42136,16 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
     const bool tp_batch_split_ffn2 = g->tp_world == 2;
     if (ok && tp_batch_split_ffn2) {
         ok = glm_graph_tp_batch_bounce_ready(g, n_tokens);
+    }
+    if (ok) {
+        ok = glm_graph_cuda_stream_prefill_batch_selected_load(
+                g,
+                model,
+                l,
+                il,
+                n_tokens,
+                gate_out * gate_row_bytes,
+                down_out * down_row_bytes);
     }
     if (ok) {
         const bool use_grouped_moe =
@@ -42624,6 +42730,16 @@ static bool glm_graph_encode_ffn_batch(
         if (!finish_ok) rocm_batch_selected_async_started = false;
     }
 #endif
+    if (ok) {
+        ok = glm_graph_cuda_stream_prefill_batch_selected_load(
+                g,
+                model,
+                l,
+                il,
+                n_tokens,
+                gate_out * gate_row_bytes,
+                down_out * down_row_bytes);
+    }
     if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) { /* ablate: keep the gate */ } else
     if (ok) ok = glm_graph_routed_moe_batch_dispatch(
             g,
