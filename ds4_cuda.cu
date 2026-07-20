@@ -21041,20 +21041,19 @@ static int routed_moe_launch(
              (getenv("DS4_CUDA_MOE_NO_Q4_SORTED") == NULL &&
               getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL &&
               getenv("DS4_CUDA_MOE_TILE4") == NULL));
-        /* The sorted-pairs/expert-tile machinery produces wrong sums for the
-         * GLM all-IQ2_XXS routed layout (observed on GB10: hidden states
-         * diverge from the exact single-token oracle at every MoE layer and
-         * recover with sorting disabled). Keep GLM on the plain per-pair
-         * kernels until the sorted path is validated for that layout;
-         * DS4_CUDA_MOE_GLM_SORTED opts back in for testing. */
         const uint32_t use_sorted_pairs =
             n_tokens > 1u &&
             (owned_filtered ||
              ((!q4k_path || use_q4_sorted_pairs) &&
-              (!iq2_down_path || getenv("DS4_CUDA_MOE_GLM_SORTED") != NULL) &&
               getenv("DS4_CUDA_MOE_NO_SORTED") == NULL));
+        /* The expert-tile gate/up kernels write mid in tile order, which the
+         * pair-ordered midq quantizer and the IQ2_XXS down kernels consume as
+         * garbage (all-IQ2_XXS GLM layouts have no tile-ordered down kernel).
+         * Verified on GB10: sorted-pairs without tiles matches the exact
+         * single-token oracle bit-for-token; with tiles the MoE output is
+         * uncorrelated noise. Keep tiles off for iq2-down layouts. */
         const uint32_t use_expert_tiles =
-            use_sorted_pairs &&
+            use_sorted_pairs && !iq2_down_path &&
             (owned_filtered || getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL);
         /* Small batches (DSpark stage chain / verify, n<=8) leave most of an
          * 8-slot expert tile empty (1-2 rows per expert): tile4 halves the
