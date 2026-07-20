@@ -220,6 +220,14 @@ static int cuda_q4_mma_ok(void) {
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
             cached = (major > 7 || (major == 7 && minor >= 5)) ? 1 : 0;
+            /* GB10 / sm_121: the Q8/Q4 MMA kernels launch successfully but
+             * write no output (observed on DGX Spark, driver 580.159: every
+             * n_tok>=8 Q8 matmul returned an untouched zero buffer while
+             * rc reported success). Disable MMA there until the kernels are
+             * validated on Blackwell integrated parts. */
+            if (major >= 12 && getenv("DS4_CUDA_MMA_SM12X") == NULL) {
+                cached = 0;
+            }
         }
     }
     return cached;
@@ -12092,7 +12100,27 @@ __global__ static void q8_0_dequant_f16_kernel(
     }
 }
 
+static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label);
+
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
+    const int rc = cuda_matmul_q8_0_tensor_labeled_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok, label);
+    if (getenv("DS4_Q8_TRACE")) {
+        float probe[2] = {0.0f, 0.0f};
+        float xin[2] = {0.0f, 0.0f};
+        (void)cudaDeviceSynchronize();
+        (void)cudaMemcpy(probe, out->ptr, sizeof(probe), cudaMemcpyDeviceToHost);
+        (void)cudaMemcpy(xin, x->ptr, sizeof(xin), cudaMemcpyDeviceToHost);
+        fprintf(stderr,
+                "ds4: q8trace off=%llu in=%llu out=%llu n=%llu rc=%d x0=%g %g y0=%g %g\n",
+                (unsigned long long)weight_offset,
+                (unsigned long long)in_dim, (unsigned long long)out_dim,
+                (unsigned long long)n_tok, rc,
+                xin[0], xin[1], probe[0], probe[1]);
+    }
+    return rc;
+}
+
+static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
@@ -12106,7 +12134,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             ? g_gpu[logical_tier].device_id : 0;
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "q8_0");
     if (!wptr) return 0;
-    if (g_cublas_ready && n_tok > 1) {
+    if (g_cublas_ready && n_tok > 1 && getenv("DS4_Q8_NO_CUBLAS") == NULL) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, physical_device, label);
         if (w_f32) {
             const float alpha = 1.0f;
@@ -13432,7 +13460,7 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "f32");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    if (g_cublas_ready && n_tok > 1) {
+    if (g_cublas_ready && n_tok > 1 && getenv("DS4_Q8_NO_CUBLAS") == NULL) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasSgemm(cuda_cublas_for_tier(logical_tier),
@@ -21013,10 +21041,17 @@ static int routed_moe_launch(
              (getenv("DS4_CUDA_MOE_NO_Q4_SORTED") == NULL &&
               getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL &&
               getenv("DS4_CUDA_MOE_TILE4") == NULL));
+        /* The sorted-pairs/expert-tile machinery produces wrong sums for the
+         * GLM all-IQ2_XXS routed layout (observed on GB10: hidden states
+         * diverge from the exact single-token oracle at every MoE layer and
+         * recover with sorting disabled). Keep GLM on the plain per-pair
+         * kernels until the sorted path is validated for that layout;
+         * DS4_CUDA_MOE_GLM_SORTED opts back in for testing. */
         const uint32_t use_sorted_pairs =
             n_tokens > 1u &&
             (owned_filtered ||
              ((!q4k_path || use_q4_sorted_pairs) &&
+              (!iq2_down_path || getenv("DS4_CUDA_MOE_GLM_SORTED") != NULL) &&
               getenv("DS4_CUDA_MOE_NO_SORTED") == NULL));
         const uint32_t use_expert_tiles =
             use_sorted_pairs &&
