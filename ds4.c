@@ -41303,7 +41303,7 @@ static bool glm_graph_indexed_prefill_scalar_kernels(void) {
 }
 
 static bool glm_graph_indexed_prefill_scalar_indexer(void) {
-    return false;
+    return getenv("DS4_GLM_SCALAR_INDEXER") != NULL;
 }
 
 static bool glm_graph_indexed_prefill_batch_indexer(void) {
@@ -41311,7 +41311,7 @@ static bool glm_graph_indexed_prefill_batch_indexer(void) {
 }
 
 static bool glm_graph_indexed_prefill_scalar_attn(void) {
-    return false;
+    return getenv("DS4_GLM_SCALAR_ATTN") != NULL;
 }
 
 static bool glm_graph_indexed_prefill_batch_qk_low(void) {
@@ -41323,6 +41323,11 @@ static bool glm_graph_indexed_prefill_batch_attn_kernel(void) {
 }
 
 static uint32_t glm_graph_indexed_prefill_batch_attn_slice_tokens(void) {
+    const char *v = getenv("DS4_GLM_ATTN_SLICE");
+    if (v && v[0]) {
+        const long n = atol(v);
+        if (n >= 1 && n <= 4096) return (uint32_t)n;
+    }
     return 2048u;
 }
 
@@ -44461,11 +44466,11 @@ static bool glm_graph_forward_indexed_tokens(
         n_tokens >= glm_tp_head_split_min(); /* small batches replicate;
                           * the floor is env-tunable for correctness
                           * isolation (DS4_GLM_TP_HEAD_SPLIT_MIN). */
-    const bool use_batch_q_rank_proj = true;
-    const bool use_batch_q_proj = true;
-    const bool use_batch_indexer_k_proj = true;
-    const bool use_batch_kv_proj = true;
-    const bool use_batch_indexer_q_proj = true;
+    const bool use_batch_q_rank_proj = getenv("DS4_GLM_SCALAR_PROJ") == NULL;
+    const bool use_batch_q_proj = use_batch_q_rank_proj;
+    const bool use_batch_indexer_k_proj = use_batch_q_rank_proj;
+    const bool use_batch_kv_proj = use_batch_q_rank_proj;
+    const bool use_batch_indexer_q_proj = use_batch_q_rank_proj;
     const bool use_batch_indexer_weights_proj = true;
     const bool use_batch_attn_out_proj = true;
     const bool use_batch_ffn = glm_graph_indexed_prefill_batch_ffn();
@@ -44551,6 +44556,15 @@ static bool glm_graph_forward_indexed_tokens(
     }
     if (ok && g->ssd_streaming && streaming_prefill_sync_each_layer) {
         ok = ds4_gpu_end_commands() != 0;
+    }
+    if (ok && getenv("DS4_GLM_HIDDEN_DUMP") &&
+        glm_debug_hidden_dump_layer_match(99u)) {
+        ok = ds4_gpu_end_commands() != 0;
+        if (ok) {
+            for (uint32_t r = 0; r < n_tokens; r++)
+                glm_debug_dump_hidden_layer(cur, r, 99u, pos0 + r);
+            ok = ds4_gpu_begin_commands() != 0;
+        }
     }
 
 #define DS4_GLM_PROFILE_INDEXED_STAGE(part_, name_) do { \
@@ -44696,6 +44710,20 @@ static bool glm_graph_forward_indexed_tokens(
                                               1.0f,
                                               DS4_ROPE_YARN_BETA_FAST,
                                               DS4_ROPE_YARN_BETA_SLOW) != 0;
+        if (ok && il == g->layer_start && getenv("DS4_GLM_QCHAIN_DUMP")) {
+            ok = ds4_gpu_end_commands() != 0;
+            if (ok) {
+                glm_debug_dump_raw_layer(g->batch_attn_norm, "attn_norm",
+                        (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float), il, -1);
+                glm_debug_dump_raw_layer(g->batch_q_rank, "q_rank",
+                        (uint64_t)n_tokens * DS4_N_LORA_Q * sizeof(float), il, -1);
+                glm_debug_dump_raw_layer(g->batch_q_rank_norm, "q_rank_norm",
+                        (uint64_t)n_tokens * DS4_N_LORA_Q * sizeof(float), il, -1);
+                glm_debug_dump_raw_layer(g->batch_q, "q",
+                        (uint64_t)n_tokens * g->q_dim * sizeof(float), il, -1);
+                ok = ds4_gpu_begin_commands() != 0;
+            }
+        }
         DS4_GLM_PROFILE_INDEXED_STAGE("glm_indexed_attn", "q_path");
 
         if (ok && glm_graph_layer_uses_full_indexer(il)) {
