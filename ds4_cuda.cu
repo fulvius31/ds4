@@ -26034,6 +26034,294 @@ static int glm_routed_moe_finish_batch(
                    "glm routed moe local output copy");
 }
 
+
+/* =========================================================================
+ * GLM IQ2_XXS batched-prefill MoE via dequant + per-expert f16 GEMM.
+ *
+ * The per-pair IQ2 dot kernels are ALU-bound on codebook lookups
+ * (~2.4 s per 2048-token chunk per layer on GB10). For large batches we
+ * instead group token/expert pairs by expert, dequantize each selected
+ * expert's tensors to f16 once, and run three cuBLAS GEMMs per expert.
+ * Output is written pair-major into `down` so the existing moe_sum_kernel
+ * performs the per-token accumulation exactly like the reference path.
+ * ========================================================================= */
+
+__global__ static void glm_iq2xxs_dequant_rows_f16_kernel(
+        __half *out,
+        const char *src_base,
+        uint64_t row_bytes,
+        uint32_t n_rows,
+        uint32_t row_elems) {
+    const uint32_t groups_per_row = row_elems >> 3u;
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (uint64_t)n_rows * groups_per_row) return;
+    const uint32_t row = (uint32_t)(gid / groups_per_row);
+    const uint32_t grp = (uint32_t)(gid - (uint64_t)row * groups_per_row);
+    const uint32_t blk = grp >> 5u;
+    const uint32_t sub = (grp >> 2u) & 7u;
+    const uint32_t g8  = grp & 3u;
+    const cuda_block_iq2_xxs *b = (const cuda_block_iq2_xxs *)
+        (src_base + (uint64_t)row * row_bytes) + blk;
+    const uint16_t *q2 = b->qs + sub * 4u;
+    const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+    const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+    const float d = 0.125f * dev_f16_to_f32(b->d) *
+                    (float)(2u * (aux1 >> 28) + 1u);
+    const uint64_t grid = cuda_iq2xxs_grid[(aux0 >> (8u * g8)) & 0xffu];
+    const uint8_t signs = cuda_ksigns_iq2xs[(aux1 >> (7u * g8)) & 127u];
+    __half *o = out + (uint64_t)row * row_elems +
+                (uint64_t)blk * 256u + sub * 32u + g8 * 8u;
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const float mag = (float)((grid >> (8 * j)) & 0xffu);
+        o[j] = __float2half(((signs >> j) & 1u) ? d * -mag : d * mag);
+    }
+}
+
+__global__ static void glm_moe_gemm_gather_x_f16_kernel(
+        __half *xg,                    /* [n_pairs][in_dim] gathered order */
+        const float *x,                /* [n_tokens][in_dim] */
+        const uint32_t *sorted_pairs,  /* [n_pairs] original pair ids */
+        uint32_t n_pairs,
+        uint32_t in_dim,
+        uint32_t n_expert) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (uint64_t)n_pairs * in_dim) return;
+    const uint32_t sp = (uint32_t)(gid / in_dim);
+    const uint32_t k = (uint32_t)(gid - (uint64_t)sp * in_dim);
+    const uint32_t pair = sorted_pairs[sp];
+    const uint32_t tok = pair / n_expert;
+    xg[gid] = __float2half(x[(uint64_t)tok * in_dim + k]);
+}
+
+__global__ static void glm_moe_gemm_silu_mul_w_f16_kernel(
+        __half *mid_h,                 /* [n_pairs][mid_dim] gathered */
+        const float *gate_g,           /* [n_pairs][mid_dim] gathered */
+        const float *up_g,
+        const float *weights,          /* [n_tokens*n_expert] router weights */
+        const uint32_t *sorted_pairs,
+        uint32_t n_pairs,
+        uint32_t mid_dim) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (uint64_t)n_pairs * mid_dim) return;
+    const uint32_t sp = (uint32_t)(gid / mid_dim);
+    const float g = gate_g[gid];
+    const float u = up_g[gid];
+    const float w = weights[sorted_pairs[sp]];
+    mid_h[gid] = __float2half((g / (1.0f + expf(-g))) * u * w);
+}
+
+__global__ static void glm_moe_gemm_scatter_down_kernel(
+        float *down_out,               /* [n_tokens*n_expert][out_dim] pair-major */
+        const float *down_g,           /* [n_pairs][out_dim] gathered */
+        const uint32_t *sorted_pairs,
+        uint32_t n_pairs,
+        uint32_t out_dim) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (uint64_t)n_pairs * out_dim) return;
+    const uint32_t sp = (uint32_t)(gid / out_dim);
+    const uint32_t k = (uint32_t)(gid - (uint64_t)sp * out_dim);
+    down_out[(uint64_t)sorted_pairs[sp] * out_dim + k] = down_g[gid];
+}
+
+extern "C" int ds4_gpu_glm_routed_moe_batch_gemm_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *down,     /* pair-major scratch, reused for sum */
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                up_expert_bytes,
+        uint64_t                up_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        uint32_t                layer_index,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_tokens) {
+    if (!out || !down || !model_map || !selected || !weights || !x ||
+        n_tokens == 0 || n_expert == 0 || n_total_expert == 0 ||
+        n_total_expert > 4096u ||
+        (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u ||
+        !g_cublas_ready) {
+        return 0;
+    }
+    const uint32_t pair_count = n_tokens * n_expert;
+    if (down->bytes < (uint64_t)pair_count * out_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *gate_w = cuda_resolve_weight_ptr(model_map, gate_offset,
+            (uint64_t)n_total_expert * gate_expert_bytes, logical_tier,
+            "glm_gemm_gate");
+    const char *up_w = cuda_resolve_weight_ptr(model_map, up_offset,
+            (uint64_t)n_total_expert * up_expert_bytes, logical_tier,
+            "glm_gemm_up");
+    const char *down_w = cuda_resolve_weight_ptr(model_map, down_offset,
+            (uint64_t)n_total_expert * down_expert_bytes, logical_tier,
+            "glm_gemm_down");
+    if (!gate_w || !up_w || !down_w) return 0;
+
+    /* Scratch layout, one arena grab. */
+    const uint64_t counts_b   = (uint64_t)n_total_expert * sizeof(uint32_t);
+    const uint64_t offsets_b  = ((uint64_t)n_total_expert + 1u) * sizeof(uint32_t);
+    const uint64_t sorted_b   = (uint64_t)pair_count * sizeof(uint32_t);
+    const uint64_t xg_b       = (uint64_t)pair_count * expert_in_dim * sizeof(__half);
+    const uint64_t gu_b       = (uint64_t)pair_count * expert_mid_dim * sizeof(float);
+    const uint64_t mid_b      = (uint64_t)pair_count * expert_mid_dim * sizeof(__half);
+    const uint64_t downg_b    = (uint64_t)pair_count * out_dim * sizeof(float);
+    const uint64_t wexp_b     = ((uint64_t)expert_mid_dim * expert_in_dim * 2u +
+                                 (uint64_t)out_dim * expert_mid_dim) * sizeof(__half);
+    uint64_t off = 0;
+#define DS4_GLM_GEMM_SLOT(var, bytes_) \
+    const uint64_t var = off; off = (off + (bytes_) + 255u) & ~255ull
+    DS4_GLM_GEMM_SLOT(o_counts, counts_b);
+    DS4_GLM_GEMM_SLOT(o_offsets, offsets_b);
+    DS4_GLM_GEMM_SLOT(o_cursors, offsets_b);
+    DS4_GLM_GEMM_SLOT(o_sorted, sorted_b);
+    DS4_GLM_GEMM_SLOT(o_xg, xg_b);
+    DS4_GLM_GEMM_SLOT(o_gate, gu_b);
+    DS4_GLM_GEMM_SLOT(o_up, gu_b);
+    DS4_GLM_GEMM_SLOT(o_mid, mid_b);
+    DS4_GLM_GEMM_SLOT(o_downg, downg_b);
+    DS4_GLM_GEMM_SLOT(o_wexp, wexp_b);
+#undef DS4_GLM_GEMM_SLOT
+    char *arena = (char *)cuda_tmp_alloc_on(logical_tier, off, "glm moe gemm");
+    if (!arena) return 0;
+    uint32_t *counts  = (uint32_t *)(arena + o_counts);
+    uint32_t *offsets = (uint32_t *)(arena + o_offsets);
+    uint32_t *cursors = (uint32_t *)(arena + o_cursors);
+    uint32_t *sorted  = (uint32_t *)(arena + o_sorted);
+    __half   *xg      = (__half *)(arena + o_xg);
+    float    *gate_g  = (float *)(arena + o_gate);
+    float    *up_g    = (float *)(arena + o_up);
+    __half   *mid_h   = (__half *)(arena + o_mid);
+    float    *down_g  = (float *)(arena + o_downg);
+    __half   *wexp    = (__half *)(arena + o_wexp);
+    __half   *wexp_gate = wexp;
+    __half   *wexp_up   = wexp + (uint64_t)expert_mid_dim * expert_in_dim;
+    __half   *wexp_down = wexp_up + (uint64_t)expert_mid_dim * expert_in_dim;
+
+    if (!cuda_ok(cudaMemsetAsync(counts, 0, counts_b), "glm gemm counts clear"))
+        return 0;
+    moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
+            counts, (const int32_t *)selected->ptr, pair_count, n_total_expert);
+    moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts,
+                                             n_total_expert);
+    moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
+            sorted, cursors, (const int32_t *)selected->ptr, pair_count,
+            n_total_expert);
+    {
+        const uint64_t n = (uint64_t)pair_count * expert_in_dim;
+        glm_moe_gemm_gather_x_f16_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
+                xg, (const float *)x->ptr, sorted, pair_count, expert_in_dim,
+                n_expert);
+    }
+    if (!cuda_ok(cudaGetLastError(), "glm gemm grouping launch")) return 0;
+
+    /* Host copy of expert offsets to drive the per-expert loop. */
+    uint32_t *h_offsets = (uint32_t *)malloc(offsets_b);
+    if (!h_offsets) return 0;
+    if (!cuda_ok(cudaMemcpy(h_offsets, offsets, offsets_b,
+                            cudaMemcpyDeviceToHost), "glm gemm offsets read")) {
+        free(h_offsets);
+        return 0;
+    }
+
+    cublasHandle_t handle = cuda_cublas_for_tier(logical_tier);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    int ok = 1;
+    const uint64_t wg_elems = (uint64_t)expert_mid_dim * expert_in_dim;
+    const uint64_t wd_elems = (uint64_t)out_dim * expert_mid_dim;
+    for (uint32_t e = 0; ok && e < n_total_expert; e++) {
+        const uint32_t cnt = h_offsets[e + 1] - h_offsets[e];
+        if (cnt == 0) continue;
+        const uint32_t base = h_offsets[e];
+        /* Dequant this expert's gate/up/down to f16. */
+        {
+            const uint64_t n = wg_elems >> 3u;
+            glm_iq2xxs_dequant_rows_f16_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
+                    wexp_gate, gate_w + (uint64_t)e * gate_expert_bytes,
+                    gate_row_bytes, expert_mid_dim, expert_in_dim);
+            glm_iq2xxs_dequant_rows_f16_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
+                    wexp_up, up_w + (uint64_t)e * up_expert_bytes,
+                    up_row_bytes, expert_mid_dim, expert_in_dim);
+            const uint64_t nd = wd_elems >> 3u;
+            glm_iq2xxs_dequant_rows_f16_kernel<<<(unsigned)((nd + 255u) / 256u), 256>>>(
+                    wexp_down, down_w + (uint64_t)e * down_expert_bytes,
+                    down_row_bytes, out_dim, expert_mid_dim);
+        }
+        /* gate_g/up_g[base..base+cnt) = Xg rows x W^T */
+        cublasStatus_t st = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)expert_mid_dim, (int)cnt, (int)expert_in_dim,
+                &alpha,
+                wexp_gate, CUDA_R_16F, (int)expert_in_dim,
+                xg + (uint64_t)base * expert_in_dim, CUDA_R_16F,
+                (int)expert_in_dim,
+                &beta,
+                gate_g + (uint64_t)base * expert_mid_dim, CUDA_R_32F,
+                (int)expert_mid_dim,
+                CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        if (st == CUBLAS_STATUS_SUCCESS) {
+            st = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    (int)expert_mid_dim, (int)cnt, (int)expert_in_dim,
+                    &alpha,
+                    wexp_up, CUDA_R_16F, (int)expert_in_dim,
+                    xg + (uint64_t)base * expert_in_dim, CUDA_R_16F,
+                    (int)expert_in_dim,
+                    &beta,
+                    up_g + (uint64_t)base * expert_mid_dim, CUDA_R_32F,
+                    (int)expert_mid_dim,
+                    CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        }
+        if (st == CUBLAS_STATUS_SUCCESS) {
+            const uint64_t n = (uint64_t)cnt * expert_mid_dim;
+            glm_moe_gemm_silu_mul_w_f16_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
+                    mid_h + (uint64_t)base * expert_mid_dim,
+                    gate_g + (uint64_t)base * expert_mid_dim,
+                    up_g + (uint64_t)base * expert_mid_dim,
+                    (const float *)weights->ptr,
+                    sorted + base,
+                    cnt, expert_mid_dim);
+            st = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    (int)out_dim, (int)cnt, (int)expert_mid_dim,
+                    &alpha,
+                    wexp_down, CUDA_R_16F, (int)expert_mid_dim,
+                    mid_h + (uint64_t)base * expert_mid_dim, CUDA_R_16F,
+                    (int)expert_mid_dim,
+                    &beta,
+                    down_g + (uint64_t)base * out_dim, CUDA_R_32F,
+                    (int)out_dim,
+                    CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        }
+        ok = cublas_ok(st, "glm moe gemm");
+    }
+    free(h_offsets);
+    if (!ok) return 0;
+    {
+        const uint64_t n = (uint64_t)pair_count * out_dim;
+        glm_moe_gemm_scatter_down_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
+                (float *)down->ptr, down_g, sorted, pair_count, out_dim);
+        const uint64_t on = (uint64_t)n_tokens * out_dim;
+        moe_sum_kernel<<<(unsigned)((on + 255u) / 256u), 256>>>(
+                (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert,
+                n_tokens);
+    }
+    (void)layer_index;
+    return cuda_ok(cudaGetLastError(), "glm moe gemm epilogue launch");
+}
+
 extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
