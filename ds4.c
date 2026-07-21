@@ -55981,6 +55981,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         true,
                         map_output,
                         &spans);
+            } else if (ds4_tp_enabled(&opt->tp) &&
+                       getenv("DS4_GLM_STREAM_TOKEN_ONLY_MAP") == NULL) {
+                /* Tensor parallelism streams only the routed experts; the
+                 * per-layer non-routed weights (attention, norms, shared
+                 * experts, output head) are touched every token on BOTH
+                 * ranks, and leaving them to on-demand paging costs ~5 ms
+                 * per layer at decode.  Map them resident across the full
+                 * layer range like the pipeline slice path does - the
+                 * streaming expert-cache auto-budget already deducts them
+                 * from the expert budget. */
+                spans_ok = weights_model_map_decode_static_slice_spans(
+                        &e->weights, 0, UINT32_MAX, true, true, &spans);
             } else {
                 spans_ok = weights_model_map_token_spans(&e->weights, &spans);
             }
@@ -56016,6 +56028,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         ds4_backend_name(e->backend),
                         load_layer_start,
                         load_end,
+                        spans.len,
+                        (double)span_bytes / 1073741824.0);
+            } else if (ds4_tp_enabled(&opt->tp) &&
+                       getenv("DS4_GLM_STREAM_TOKEN_ONLY_MAP") == NULL) {
+                fprintf(stderr,
+                        "ds4: SSD streaming initial %s model map: token + all non-routed layers + output (TP resident non-routed, %u spans, %.2f GiB tensor span)\n",
+                        ds4_backend_name(e->backend),
                         spans.len,
                         (double)span_bytes / 1073741824.0);
             } else {
