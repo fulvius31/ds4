@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda.h>
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cublas_v2.h>
@@ -10,6 +11,8 @@
 #include <float.h>
 #include <math.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 
@@ -2981,6 +2985,36 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return t;
 }
 
+/* Pinned host-mapped tensor (UVA: one pointer valid on both CPU and GPU).
+ * The TP transport slab and bounce buffers live here: the gate service
+ * thread and the wire exchange read and write them CPU-side without any
+ * CUDA call while kernels and stream memops touch them GPU-side.  On the
+ * GB10's unified DRAM this is full-speed memory, not a PCIe staging
+ * window.  Freed with cudaFreeHost, tracked in a side set so the shared
+ * ds4_gpu_tensor struct stays unchanged. */
+static std::unordered_set<void *> g_host_alloc_ptrs;
+static pthread_mutex_t g_host_alloc_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_shared(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    int ok = 0;
+    WITH_DEVICE(g_gpu[0].device_id) {
+        ok = cuda_ok(cudaHostAlloc(&t->ptr, (size_t)bytes,
+                                   cudaHostAllocMapped | cudaHostAllocPortable),
+                     "shared tensor alloc");
+    }
+    if (!ok) { free(t); return NULL; }
+    t->bytes = bytes;
+    t->owner = 1;
+    t->device_id = 0;
+    pthread_mutex_lock(&g_host_alloc_mutex);
+    g_host_alloc_ptrs.insert(t->ptr);
+    pthread_mutex_unlock(&g_host_alloc_mutex);
+    return t;
+}
+
 /* Heap-allocated tensor on a specific logical tier.
  *
  * Mirrors the legacy ds4_gpu_tensor_alloc ABI (returns ds4_gpu_tensor *)
@@ -3097,8 +3131,15 @@ extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
     int d = ds4_tensor_device_idx(tensor);
     if (tensor->owner && tensor->ptr) {
-        WITH_DEVICE(g_gpu[d].device_id) {
-            (void)cudaFree(tensor->ptr);
+        pthread_mutex_lock(&g_host_alloc_mutex);
+        const int host_owned = g_host_alloc_ptrs.erase(tensor->ptr) != 0;
+        pthread_mutex_unlock(&g_host_alloc_mutex);
+        if (host_owned) {
+            (void)cudaFreeHost(tensor->ptr);
+        } else {
+            WITH_DEVICE(g_gpu[d].device_id) {
+                (void)cudaFree(tensor->ptr);
+            }
         }
     }
     free(tensor);
@@ -19843,7 +19884,12 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     uint32_t tok = pair / n_expert;
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) expert_i = 0;
+    /* Slot emptied by padding or by TP staging (peer-owned expert): the
+     * whole block serves this one slot, so the return is uniform and
+     * safe ahead of the __syncthreads below.  The direct down-sum skips
+     * the same negative slots, so the untouched mid slice is never
+     * read. */
+    if (expert_i < 0) return;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
@@ -23536,6 +23582,13 @@ __global__ static void moe_down_f32_kernel(
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
 }
 
+/* TP core accessors (defined with the gate machinery further below). */
+static int cuda_tp_world_is_two(void);
+static int32_t cuda_tp_rank(void);
+static void cuda_tp_expert_range(uint32_t n_total_expert,
+                                 uint32_t *first_expert,
+                                 uint32_t *n_expert);
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -24037,6 +24090,46 @@ static int routed_moe_launch(
         const uint32_t use_direct_down_sum =
             n_tokens == 1u && (n_expert == 6u || n_expert == 3u) &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
+        /* 50/50 tensor parallelism (GLM decode over the streamed expert
+         * cache).  Ownership was applied at staging time: peer-owned
+         * slots are -1 in the compact slot table, the decode LUT gate/up
+         * kernel and the sum8 down-sum skip them, so this rank's output
+         * is the partial over its owned experts (an exact zero when it
+         * owns none for this token).  Layers that bypass the cache fall
+         * back to rank 0 computing the full routed output while rank 1
+         * contributes an exact zero.  Anything else under TP is refused
+         * loudly - never silently double-counted. */
+        if (cuda_tp_world_is_two() && !owned_filtered) {
+            if (n_tokens != 1u) {
+                fprintf(stderr,
+                        "ds4: CUDA GLM TP: batched routed MoE is unsupported "
+                        "(token prefill only)\n");
+                return 0;
+            }
+            if (use_stream_selected_cache && iq2_down_path && n_expert == 8u) {
+                if (!use_decode_lut_gate || !use_direct_down_sum) {
+                    fprintf(stderr,
+                            "ds4: CUDA GLM TP requires the decode LUT + sum8 "
+                            "path (disabled by env?)\n");
+                    return 0;
+                }
+                /* Staged slot table already carries the ownership filter. */
+            } else if (n_expert == 8u) {
+                if (cuda_tp_rank() == 1) {
+                    fill_f32_kernel<<<(out_dim + 255u) / 256u, 256>>>(
+                            (float *)out->ptr, out_dim, 0.0f);
+                    return cuda_ok(cudaGetLastError(),
+                                   "tp routed zero partial launch");
+                }
+                /* Rank 0 computes the full routed output for this layer. */
+            } else {
+                fprintf(stderr,
+                        "ds4: CUDA TP: unsupported routed shape "
+                        "(n_expert=%u gate=%u down=%u)\n",
+                        n_expert, gate_type, down_type);
+                return 0;
+            }
+        }
         const uint32_t use_direct_midq =
             q4k_path && use_direct_down_sum && !write_gate_up &&
             getenv("DS4_CUDA_MOE_DIRECT_MIDQ") != NULL &&
@@ -26108,6 +26201,16 @@ static int cuda_stream_selected_cache_begin_load(
     } catch (...) {
         return 0;
     }
+    /* 50/50 tensor parallelism: peer-owned experts are never staged on
+     * this rank.  Their slots become -1 in the compact slot table, which
+     * the decode kernels treat as empty, so the routed output is this
+     * rank's partial over its owned experts. */
+    uint32_t tp_first = 0;
+    uint32_t tp_count = table->n_total_expert;
+    const int tp_split = cuda_tp_world_is_two();
+    if (tp_split) {
+        cuda_tp_expert_range(table->n_total_expert, &tp_first, &tp_count);
+    }
     for (uint32_t i = 0; i < slot_count; i++) {
         const int32_t expert = selected_ids[i];
         if (expert < 0 || (uint32_t)expert >= table->n_total_expert) {
@@ -26115,6 +26218,11 @@ static int cuda_stream_selected_cache_begin_load(
                     "ds4: CUDA streaming expert id %d is outside 0..%u at layer %u\n",
                     expert, table->n_total_expert, table->layer);
             return 0;
+        }
+        if (tp_split && ((uint32_t)expert < tp_first ||
+                         (uint32_t)expert >= tp_first + tp_count)) {
+            slot_ids[i] = -1;
+            continue;
         }
         int32_t compact = expert_to_slot[(uint32_t)expert];
         if (compact < 0) {
@@ -26124,7 +26232,16 @@ static int cuda_stream_selected_cache_begin_load(
         }
         slot_ids[i] = compact;
     }
-    if (compact_ids.empty() || compact_ids.size() > UINT32_MAX) return 0;
+    if (compact_ids.empty()) {
+        if (!tp_split) return 0;
+        /* Every selected expert belongs to the peer this token.  Stage
+         * one owned expert as a structural placeholder (usually a cache
+         * hit): every slot stays -1, so no kernel ever reads it and the
+         * routed partial is an exact zero. */
+        expert_to_slot[tp_first] = 0;
+        compact_ids.push_back((int32_t)tp_first);
+    }
+    if (compact_ids.size() > UINT32_MAX) return 0;
     const uint64_t compact_count = compact_ids.size();
     if (compact_count > UINT64_MAX / table->gate_expert_bytes ||
         compact_count > UINT64_MAX / table->down_expert_bytes) {
@@ -30752,21 +30869,563 @@ extern "C" int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *te
                    "selected tensor read");
 }
 
-extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
-                               const ds4_gpu_tensor *out_t,
-                               ds4_gpu_tensor *in_t,
-                               uint64_t bytes) {
-    fprintf(stderr, "ds4: CUDA stub called: ds4_gpu_tp_big_gate_encode\n");
+/* ------------------------------------------------------------------------
+ * Tensor-parallel gate machinery: CUDA port of the Metal TP core in
+ * ds4_metal.m.  Same contract:
+ *
+ *  - Two monotonic sequence spaces.  Row gates (per-layer decode
+ *    partials) and batch gates (verify blocks + prefill big gates) never
+ *    share seq values or release words, so a small batch seq can never
+ *    satisfy a wait armed against the larger row seq.
+ *  - Arrival (GPU -> service thread) defaults to per-slot 32-bit flag
+ *    words in the transport slab (slot = layer * 2 + gate), written in
+ *    stream order by cuStreamWriteValue32 with default flags: the
+ *    preceding system-scope memory barrier makes the partial-output
+ *    payload CPU-visible before the flag lands — the CUDA equivalent of
+ *    the Metal buffer hazard.  Batch flag values carry bit 31
+ *    (DS4_CUDA_TP_BATCH_FLAG_TAG) exactly like Metal, so a stale row seq
+ *    in the reused FFN flag word can never satisfy a batch spin.
+ *  - DS4_TP_EVENT_GATES=1 or session batch mode publish arrival through
+ *    one 64-bit word per sequence space instead (the shared-event
+ *    analog).  Big gates ALWAYS arrive through the batch event word:
+ *    the barrier write is what guarantees the bounce payload is
+ *    CPU-visible before the exchange reads it.
+ *  - Release (service thread -> GPU) is a pinned word per space: the GPU
+ *    blocks in cuStreamWaitValue with GEQ so a later release can never
+ *    wedge an earlier wait, and the service thread stores the seq with
+ *    release ordering after the exchange payload is in place.  On
+ *    exchange failure the release still fires (the GPU must never
+ *    deadlock); the failure latches in g_tp_failed_flag and the eval
+ *    aborts at the next boundary.
+ *  - The service thread is sync-free by construction: pinned host reads,
+ *    the transport callback, and a host store.  It never enters the CUDA
+ *    runtime, so it cannot deadlock against the blocked stream.
+ *
+ * Unlike Metal, requests are queued BEFORE the stream ops are enqueued:
+ * CUDA cannot un-enqueue a wait, so a queue-overflow failure must happen
+ * while the stream is still clean.  The service thread simply spins until
+ * the arrival value lands.  ds4_gpu_tp_shutdown() stores the max value
+ * into both release words so any wait still parked in the stream after an
+ * aborted eval drains instead of hanging device teardown.
+ */
+
+#define DS4_CUDA_TP_BATCH_FLAG_TAG 0x80000000u
+
+/* Callback typedefs mirror ds4_gpu.h (this file self-declares its API). */
+typedef int (*ds4_gpu_tp_exchange_fn)(void *ud, uint32_t layer, uint32_t gate,
+                                      uint64_t seq);
+typedef int (*ds4_gpu_tp_batch_exchange_fn)(void *ud, uint32_t layer,
+                                            uint32_t rows, uint64_t seq);
+typedef int (*ds4_gpu_tp_big_exchange_fn)(void *ud, uint32_t layer,
+                                          uint64_t seq, const void *out,
+                                          void *in, uint64_t bytes);
+
+typedef struct {
+    uint32_t layer;
+    uint32_t gate;
+    uint32_t rows;          /* 0 = row gate; >0 = batch/big gate */
+    uint32_t event_arrival;
+    uint64_t seq;
+    const void *big_out;    /* big gates: bounce payload out/in */
+    void *big_in;
+    uint64_t big_bytes;
+} cuda_tp_request;
+
+enum { CUDA_TP_QUEUE = 1024 };
+
+/* Pinned sync words (8-byte slots; the 32-bit memops fallback uses the
+ * low half — wrap unreachable, 2^32 gates is ~57M decoded tokens). */
+enum {
+    CUDA_TP_WORD_ROW_ARRIVAL = 0,
+    CUDA_TP_WORD_BATCH_ARRIVAL = 1,
+    CUDA_TP_WORD_ROW_RELEASE = 2,
+    CUDA_TP_WORD_BATCH_RELEASE = 3,
+    CUDA_TP_WORDS = 4,
+};
+
+static int32_t g_tp_split_rank;
+static int32_t g_tp_split_world = 1;
+static int g_tp_session_batch_mode;
+static int g_tp_attn_head_split;
+static int g_tp_flag_gates;
+static int g_tp_memops_64;
+static volatile uint32_t *g_tp_gpu_flags;    /* CPU view of slab flag words */
+static CUdeviceptr g_tp_gpu_flags_dev;       /* GPU address of the same */
+static volatile uint64_t *g_tp_sync_words;   /* CPU view, pinned */
+static CUdeviceptr g_tp_sync_words_dev;
+static uint64_t g_tp_seq;
+static uint64_t g_tp_batch_seq;
+static ds4_gpu_tp_exchange_fn g_tp_exchange_fn;
+static ds4_gpu_tp_batch_exchange_fn g_tp_batch_exchange_fn;
+static ds4_gpu_tp_big_exchange_fn g_tp_big_exchange_fn;
+static void *g_tp_exchange_ud;
+static pthread_t g_tp_thread;
+static int g_tp_thread_running;
+static int g_tp_shutdown;
+static int g_tp_failed_flag;
+static volatile int g_tp_keepalive_paused;
+static pthread_mutex_t g_tp_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_tp_cond = PTHREAD_COND_INITIALIZER;
+static cuda_tp_request g_tp_queue[CUDA_TP_QUEUE];
+static uint32_t g_tp_queue_head;
+static uint32_t g_tp_queue_count;
+static uint64_t g_tp_stat_gates;
+static double g_tp_stat_gpu_wait_ms;
+static double g_tp_stat_exchange_ms;
+
+static int cuda_tp_drv_ok(CUresult r, const char *what) {
+    if (r == CUDA_SUCCESS) return 1;
+    const char *s = NULL;
+    (void)cuGetErrorString(r, &s);
+    fprintf(stderr, "ds4: TP driver call failed: %s: %s\n",
+            what, s ? s : "unknown");
     return 0;
 }
 
-extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
-    fprintf(stderr, "ds4: CUDA stub called: ds4_gpu_tp_gate_encode\n");
-    return 0;
+static double cuda_tp_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static int cuda_tp_world_is_two(void) {
+    return g_tp_split_world == 2;
+}
+
+static int32_t cuda_tp_rank(void) {
+    return g_tp_split_rank;
+}
+
+/* Contiguous routed-expert range backed by this rank; rank 1 owns the
+ * high range plus any odd-count remainder (identical to Metal). */
+static void cuda_tp_expert_range(uint32_t n_total_expert,
+                                 uint32_t *first_expert,
+                                 uint32_t *n_expert) {
+    *first_expert = 0;
+    *n_expert = n_total_expert;
+    if (g_tp_split_world != 2) return;
+    const uint32_t low_experts = n_total_expert / 2u;
+    if (g_tp_split_rank == 1) {
+        *first_expert = low_experts;
+        *n_expert = n_total_expert - low_experts;
+    } else {
+        *n_expert = low_experts;
+    }
+}
+
+static void DS4_CUDA_UNUSED cuda_tp_attn_head_range(uint32_t n_head,
+                                                    uint32_t group,
+                                                    uint32_t *head_base,
+                                                    uint32_t *head_count) {
+    *head_base = 0;
+    *head_count = n_head;
+    if (!g_tp_attn_head_split || g_tp_split_world != 2) return;
+    const uint32_t half = n_head / 2u;
+    if (half == 0u || (half % group) != 0u || (n_head % 2u) != 0u) return;
+    *head_count = half;
+    *head_base = g_tp_split_rank == 1 ? half : 0u;
 }
 
 extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled) {
-    (void)enabled;   /* Mac network-TP head split: no-op on CUDA */
+    g_tp_attn_head_split = enabled ? 1 : 0;
+}
+
+/* True when a pointer is CPU-dereferenceable (pinned host or managed):
+ * the slab and big-gate bounce buffers must be, since the service thread
+ * reads them without any CUDA call. */
+static int cuda_tp_host_visible(const void *p) {
+    if (!p) return 0;
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, p) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return attr.type == cudaMemoryTypeHost ||
+           attr.type == cudaMemoryTypeManaged;
+}
+
+static int cuda_tp_stream_write_seq(uint32_t word, uint64_t seq,
+                                    const char *what) {
+    const CUdeviceptr addr = g_tp_sync_words_dev + (CUdeviceptr)word * 8u;
+    if (g_tp_memops_64)
+        return cuda_tp_drv_ok(
+                cuStreamWriteValue64(CU_STREAM_LEGACY, addr, (cuuint64_t)seq,
+                                     CU_STREAM_WRITE_VALUE_DEFAULT), what);
+    return cuda_tp_drv_ok(
+            cuStreamWriteValue32(CU_STREAM_LEGACY, addr, (cuuint32_t)seq,
+                                 CU_STREAM_WRITE_VALUE_DEFAULT), what);
+}
+
+static int cuda_tp_stream_wait_seq_geq(uint32_t word, uint64_t seq,
+                                       const char *what) {
+    const CUdeviceptr addr = g_tp_sync_words_dev + (CUdeviceptr)word * 8u;
+    if (g_tp_memops_64)
+        return cuda_tp_drv_ok(
+                cuStreamWaitValue64(CU_STREAM_LEGACY, addr, (cuuint64_t)seq,
+                                    CU_STREAM_WAIT_VALUE_GEQ), what);
+    return cuda_tp_drv_ok(
+            cuStreamWaitValue32(CU_STREAM_LEGACY, addr, (cuuint32_t)seq,
+                                CU_STREAM_WAIT_VALUE_GEQ), what);
+}
+
+static uint64_t cuda_tp_sync_word_load(uint32_t word) {
+    if (g_tp_memops_64)
+        return __atomic_load_n(&g_tp_sync_words[word], __ATOMIC_ACQUIRE);
+    return (uint64_t)__atomic_load_n(
+            (volatile uint32_t *)&g_tp_sync_words[word], __ATOMIC_ACQUIRE);
+}
+
+static void cuda_tp_sync_word_release(uint32_t word, uint64_t seq) {
+    if (g_tp_memops_64) {
+        __atomic_store_n(&g_tp_sync_words[word], seq, __ATOMIC_RELEASE);
+        return;
+    }
+    __atomic_store_n((volatile uint32_t *)&g_tp_sync_words[word],
+                     (uint32_t)seq, __ATOMIC_RELEASE);
+}
+
+static void *cuda_tp_service_thread(void *arg) {
+    (void)arg;
+    const bool profile = getenv("DS4_TP_GATE_PROFILE") != NULL;
+    while (1) {
+        pthread_mutex_lock(&g_tp_mutex);
+        while (g_tp_queue_count == 0 && !g_tp_shutdown)
+            pthread_cond_wait(&g_tp_cond, &g_tp_mutex);
+        if (g_tp_shutdown && g_tp_queue_count == 0) {
+            pthread_mutex_unlock(&g_tp_mutex);
+            break;
+        }
+        cuda_tp_request req = g_tp_queue[g_tp_queue_head];
+        g_tp_queue_head = (g_tp_queue_head + 1) % CUDA_TP_QUEUE;
+        g_tp_queue_count--;
+        pthread_mutex_unlock(&g_tp_mutex);
+
+        /* Wait for the GPU to publish this gate.  Tight spin: gate
+         * arrival is on the decode critical path and normally tens of
+         * microseconds out. */
+        const double t0 = profile ? cuda_tp_now_ms() : 0.0;
+        uint32_t spins = 0;
+        if (!req.event_arrival) {
+            const uint32_t slot = req.layer * 2u + req.gate;
+            uint32_t want = (uint32_t)req.seq;
+            if (req.rows > 0)
+                want = DS4_CUDA_TP_BATCH_FLAG_TAG | (uint32_t)req.seq;
+            while (__atomic_load_n(&g_tp_gpu_flags[slot],
+                                   __ATOMIC_ACQUIRE) != want) {
+                if (g_tp_shutdown) break;
+                if (++spins > (1u << 20)) {
+                    sched_yield();
+                    spins = 0;
+                }
+            }
+        } else {
+            const uint32_t word = req.rows > 0 ? CUDA_TP_WORD_BATCH_ARRIVAL
+                                               : CUDA_TP_WORD_ROW_ARRIVAL;
+            while (cuda_tp_sync_word_load(word) < req.seq) {
+                if (g_tp_shutdown) break;
+                if (++spins > (1u << 16)) sched_yield();
+            }
+        }
+        const double t1 = profile ? cuda_tp_now_ms() : 0.0;
+        int ok = 0;
+        if (!g_tp_shutdown && !g_tp_failed_flag) {
+            if (req.big_bytes > 0) {
+                if (g_tp_big_exchange_fn)
+                    ok = g_tp_big_exchange_fn(g_tp_exchange_ud, req.layer,
+                                              req.seq, req.big_out,
+                                              req.big_in, req.big_bytes);
+            } else if (req.rows > 0) {
+                if (g_tp_batch_exchange_fn)
+                    ok = g_tp_batch_exchange_fn(g_tp_exchange_ud, req.layer,
+                                                req.rows, req.seq);
+            } else if (g_tp_exchange_fn) {
+                ok = g_tp_exchange_fn(g_tp_exchange_ud, req.layer, req.gate,
+                                      req.seq);
+            }
+        }
+        if (!ok && !g_tp_shutdown) {
+            if (!g_tp_failed_flag)
+                fprintf(stderr,
+                        "ds4: TP gate exchange failed (layer %u gate %u seq %llu)\n",
+                        req.layer, req.gate, (unsigned long long)req.seq);
+            g_tp_failed_flag = 1;
+        }
+        /* Release the GPU even on failure so the stream can drain. */
+        cuda_tp_sync_word_release(req.rows > 0 ? CUDA_TP_WORD_BATCH_RELEASE
+                                               : CUDA_TP_WORD_ROW_RELEASE,
+                                  req.seq);
+        if (profile) {
+            g_tp_stat_gpu_wait_ms += t1 - t0;
+            g_tp_stat_exchange_ms += cuda_tp_now_ms() - t1;
+            if (++g_tp_stat_gates % 860 == 0) {
+                fprintf(stderr,
+                        "ds4: TP gates %llu: avg gpu-wait %.1f us, avg exchange %.1f us\n",
+                        (unsigned long long)g_tp_stat_gates,
+                        g_tp_stat_gpu_wait_ms / (double)g_tp_stat_gates * 1000.0,
+                        g_tp_stat_exchange_ms / (double)g_tp_stat_gates * 1000.0);
+            }
+        }
+    }
+    return NULL;
+}
+
+static int cuda_tp_queue_push(uint32_t layer, uint32_t gate, uint32_t rows,
+                              int event_arrival, uint64_t seq,
+                              const void *big_out, void *big_in,
+                              uint64_t big_bytes) {
+    pthread_mutex_lock(&g_tp_mutex);
+    if (g_tp_queue_count >= CUDA_TP_QUEUE) {
+        pthread_mutex_unlock(&g_tp_mutex);
+        fprintf(stderr, "ds4: TP gate queue overflow\n");
+        return 0;
+    }
+    const uint32_t tail = (g_tp_queue_head + g_tp_queue_count) % CUDA_TP_QUEUE;
+    g_tp_queue[tail].layer = layer;
+    g_tp_queue[tail].gate = gate;
+    g_tp_queue[tail].rows = rows;
+    g_tp_queue[tail].event_arrival = event_arrival ? 1u : 0u;
+    g_tp_queue[tail].seq = seq;
+    g_tp_queue[tail].big_out = big_out;
+    g_tp_queue[tail].big_in = big_in;
+    g_tp_queue[tail].big_bytes = big_bytes;
+    g_tp_queue_count++;
+    pthread_cond_signal(&g_tp_cond);
+    pthread_mutex_unlock(&g_tp_mutex);
+    return 1;
+}
+
+extern "C" int ds4_gpu_tp_init(uint32_t rank,
+                               ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
+                               ds4_gpu_tp_exchange_fn fn, void *ud) {
+    if (g_tp_thread_running || rank > 1 || !slab || !slab->ptr) return 0;
+    if (g_n_gpus != 1) {
+        fprintf(stderr, "ds4: CUDA TP requires a single GPU tier (have %d)\n",
+                g_n_gpus);
+        return 0;
+    }
+    if (!cuda_tp_host_visible(slab->ptr)) {
+        fprintf(stderr,
+                "ds4: CUDA TP slab must be host-visible (allocate it with "
+                "ds4_gpu_tensor_alloc_shared)\n");
+        return 0;
+    }
+    if (gpu_flags_off >= slab->bytes) return 0;
+    /* Bind the primary context on this thread for the driver-API calls. */
+    if (!cuda_ok(cudaFree(0), "tp context bind")) return 0;
+    g_tp_gpu_flags =
+            (volatile uint32_t *)((uint8_t *)slab->ptr + gpu_flags_off);
+    g_tp_gpu_flags_dev =
+            (CUdeviceptr)(uintptr_t)((uint8_t *)slab->ptr + gpu_flags_off);
+    if (!g_tp_sync_words) {
+        void *words = NULL;
+        if (!cuda_ok(cudaHostAlloc(&words, CUDA_TP_WORDS * 8u,
+                                   cudaHostAllocMapped),
+                     "tp sync words alloc"))
+            return 0;
+        memset(words, 0, CUDA_TP_WORDS * 8u);
+        g_tp_sync_words = (volatile uint64_t *)words;
+        g_tp_sync_words_dev = (CUdeviceptr)(uintptr_t)words;
+    } else {
+        memset((void *)g_tp_sync_words, 0, CUDA_TP_WORDS * 8u);
+    }
+    /* Live-probe stream memops (64-bit first): a probe write beats
+     * trusting attribute tables, and the GB10 gate probe validated
+     * exactly this mechanism (8 us flag RTT). */
+    g_tp_memops_64 = 1;
+    if (cuStreamWriteValue64(CU_STREAM_LEGACY, g_tp_sync_words_dev, 0,
+                             CU_STREAM_WRITE_VALUE_DEFAULT) != CUDA_SUCCESS) {
+        g_tp_memops_64 = 0;
+        if (!cuda_tp_drv_ok(
+                    cuStreamWriteValue32(CU_STREAM_LEGACY, g_tp_sync_words_dev,
+                                         0, CU_STREAM_WRITE_VALUE_DEFAULT),
+                    "tp stream memops probe")) {
+            fprintf(stderr,
+                    "ds4: CUDA TP needs stream memops (cuStreamWriteValue)\n");
+            return 0;
+        }
+    }
+    if (!cuda_ok(cudaStreamSynchronize(0), "tp memops probe sync")) return 0;
+    g_tp_split_rank = (int32_t)rank;
+    g_tp_split_world = 2;
+    g_tp_flag_gates = getenv("DS4_TP_EVENT_GATES") == NULL;
+    g_tp_exchange_fn = fn;
+    g_tp_exchange_ud = ud;
+    g_tp_seq = 0;
+    g_tp_batch_seq = 0;
+    g_tp_shutdown = 0;
+    g_tp_failed_flag = 0;
+    g_tp_queue_head = 0;
+    g_tp_queue_count = 0;
+    if (pthread_create(&g_tp_thread, NULL, cuda_tp_service_thread, NULL) != 0) {
+        fprintf(stderr, "ds4: failed to start TP gate service thread\n");
+        g_tp_split_world = 1;
+        return 0;
+    }
+    g_tp_thread_running = 1;
+    fprintf(stderr,
+            "ds4: CUDA TP gates: %s arrival, %d-bit memops, no keep-alive "
+            "(pin clocks with nvidia-smi -lgc if decode clocks sag)\n",
+            g_tp_flag_gates ? "slab-flag" : "event-word",
+            g_tp_memops_64 ? 64 : 32);
+    return 1;
+}
+
+extern "C" void ds4_gpu_tp_shutdown(void) {
+    if (!g_tp_thread_running) return;
+    pthread_mutex_lock(&g_tp_mutex);
+    g_tp_shutdown = 1;
+    pthread_cond_broadcast(&g_tp_cond);
+    pthread_mutex_unlock(&g_tp_mutex);
+    pthread_join(g_tp_thread, NULL);
+    g_tp_thread_running = 0;
+    /* Unblock any release wait still parked in the stream (aborted eval):
+     * GEQ semantics make the max value pass every wait.  The next init
+     * re-zeroes the words after a full stream sync. */
+    if (g_tp_sync_words) {
+        const uint64_t drain = g_tp_memops_64 ? UINT64_MAX
+                                              : (uint64_t)UINT32_MAX;
+        cuda_tp_sync_word_release(CUDA_TP_WORD_ROW_RELEASE, drain);
+        cuda_tp_sync_word_release(CUDA_TP_WORD_BATCH_RELEASE, drain);
+    }
+    g_tp_exchange_fn = NULL;
+    g_tp_batch_exchange_fn = NULL;
+    g_tp_big_exchange_fn = NULL;
+    g_tp_exchange_ud = NULL;
+    g_tp_split_rank = 0;
+    g_tp_split_world = 1;
+    g_tp_session_batch_mode = 0;
+    g_tp_gpu_flags = NULL;
+    g_tp_gpu_flags_dev = 0;
+}
+
+extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
+    if (!g_tp_thread_running) return;
+    g_tp_split_world = suspend ? 1 : 2;
+}
+
+extern "C" void ds4_gpu_tp_keepalive_pause(int paused) {
+    /* No DVFS keep-alive thread on CUDA yet: GB10 clocks are held with
+     * nvidia-smi -lgc when a measurement needs them pinned. */
+    g_tp_keepalive_paused = paused;
+}
+
+extern "C" void ds4_gpu_tp_set_session_batch_mode(int enabled) {
+    g_tp_session_batch_mode = enabled ? 1 : 0;
+}
+
+extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
+    g_tp_batch_exchange_fn = fn;
+}
+
+extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
+    g_tp_big_exchange_fn = fn;
+}
+
+extern "C" int ds4_gpu_tp_failed(void) {
+    return g_tp_failed_flag;
+}
+
+extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
+    if (!g_tp_thread_running) {
+        fprintf(stderr,
+                "ds4: TP gate encode without the gate service (layer %u)\n",
+                layer);
+        return 0;
+    }
+    const uint64_t seq = ++g_tp_seq;
+    const int event_arrival = g_tp_session_batch_mode || !g_tp_flag_gates;
+    if (!cuda_tp_queue_push(layer, gate, 0u, event_arrival, seq,
+                            NULL, NULL, 0))
+        return 0;
+    int ok;
+    if (!event_arrival) {
+        const uint32_t slot = layer * 2u + gate;
+        ok = cuda_tp_drv_ok(
+                cuStreamWriteValue32(CU_STREAM_LEGACY,
+                                     g_tp_gpu_flags_dev + (CUdeviceptr)slot * 4u,
+                                     (cuuint32_t)(uint32_t)seq,
+                                     CU_STREAM_WRITE_VALUE_DEFAULT),
+                "tp row flag write");
+    } else {
+        ok = cuda_tp_stream_write_seq(CUDA_TP_WORD_ROW_ARRIVAL, seq,
+                                      "tp row arrival write");
+    }
+    if (ok)
+        ok = cuda_tp_stream_wait_seq_geq(CUDA_TP_WORD_ROW_RELEASE, seq,
+                                         "tp row release wait");
+    if (!ok) g_tp_failed_flag = 1;
+    return ok;
+}
+
+extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+    if (!g_tp_thread_running || rows == 0) return 0;
+    const uint64_t seq = ++g_tp_batch_seq;
+    const int event_arrival = g_tp_session_batch_mode || !g_tp_flag_gates;
+    if (!cuda_tp_queue_push(layer, 1u /* FFN */, rows, event_arrival, seq,
+                            NULL, NULL, 0))
+        return 0;
+    int ok;
+    if (!event_arrival) {
+        const uint32_t slot = layer * 2u + 1u; /* FFN gate slot */
+        const uint32_t value = DS4_CUDA_TP_BATCH_FLAG_TAG | (uint32_t)seq;
+        ok = cuda_tp_drv_ok(
+                cuStreamWriteValue32(CU_STREAM_LEGACY,
+                                     g_tp_gpu_flags_dev + (CUdeviceptr)slot * 4u,
+                                     (cuuint32_t)value,
+                                     CU_STREAM_WRITE_VALUE_DEFAULT),
+                "tp batch flag write");
+    } else {
+        ok = cuda_tp_stream_write_seq(CUDA_TP_WORD_BATCH_ARRIVAL, seq,
+                                      "tp batch arrival write");
+    }
+    if (ok)
+        ok = cuda_tp_stream_wait_seq_geq(CUDA_TP_WORD_BATCH_RELEASE, seq,
+                                         "tp batch release wait");
+    if (!ok) g_tp_failed_flag = 1;
+    return ok;
+}
+
+extern "C" uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
+                                             const ds4_gpu_tensor *out_t,
+                                             ds4_gpu_tensor *in_t,
+                                             uint64_t bytes) {
+    if (!g_tp_thread_running || rows == 0 || bytes == 0) return 0;
+    const void *out_ptr = out_t ? out_t->ptr : NULL;
+    void *in_ptr = in_t ? in_t->ptr : NULL;
+    if (!cuda_tp_host_visible(out_ptr) || !cuda_tp_host_visible(in_ptr)) {
+        fprintf(stderr, "ds4: TP big gate needs CPU-visible bounce buffers\n");
+        return 0;
+    }
+    const uint64_t seq = ++g_tp_batch_seq;
+    if (!cuda_tp_queue_push(layer, 1u, rows, 1 /* always event arrival */,
+                            seq, out_ptr, in_ptr, bytes))
+        return 0;
+    if (!cuda_tp_stream_write_seq(CUDA_TP_WORD_BATCH_ARRIVAL, seq,
+                                  "tp big arrival write")) {
+        g_tp_failed_flag = 1;
+        return 0;
+    }
+    return seq;
+}
+
+extern "C" int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
+    if (!g_tp_thread_running || seq == 0) return 0;
+    if (!cuda_tp_stream_wait_seq_geq(CUDA_TP_WORD_BATCH_RELEASE, seq,
+                                     "tp big release wait")) {
+        g_tp_failed_flag = 1;
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
+                                          const ds4_gpu_tensor *out_t,
+                                          ds4_gpu_tensor *in_t,
+                                          uint64_t bytes) {
+    const uint64_t seq = ds4_gpu_tp_big_gate_kick(layer, rows, out_t, in_t,
+                                                  bytes);
+    if (seq == 0) return 0;
+    return ds4_gpu_tp_big_gate_wait(seq);
 }
 
 extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label) {
@@ -31075,32 +31734,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
     return 0;
 }
 
-extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
-    (void)suspend;
-}
-
-extern "C" void ds4_gpu_tp_keepalive_pause(int paused) {
-    (void)paused;
-}
-
 extern "C" void ds4_gpu_model_residency_skip(int skip) {
     (void)skip;
-}
-
-extern "C" uint64_t ds4_gpu_tp_big_gate_kick(
-        uint32_t layer, uint32_t rows, const ds4_gpu_tensor *out_t,
-        ds4_gpu_tensor *in_t, uint64_t bytes) {
-    (void)layer; (void)rows; (void)out_t; (void)in_t; (void)bytes;
-    return 0;
-}
-
-extern "C" int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
-    (void)seq;
-    return 0;
-}
-
-extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
-    (void)layer; (void)rows;
-    return 0;
 }
 #pragma GCC diagnostic pop

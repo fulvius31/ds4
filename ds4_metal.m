@@ -7904,6 +7904,11 @@ int ds4_gpu_init(void) {
     return 1;
 }
 
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_shared(uint64_t bytes) {
+    /* Every Metal heap buffer here is storage-mode shared already. */
+    return ds4_gpu_tensor_alloc(bytes);
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;

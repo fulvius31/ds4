@@ -40429,7 +40429,8 @@ static int glm_graph_routed_moe_batch_dispatch(
         }
         /* Large chunks: dequant + per-expert GEMM runs on tensor cores and
          * is ~10x the per-pair dot kernels; fall through on any failure. */
-        if (n_tokens >= 128u &&
+        if (n_tokens >= (getenv("DS4_GLM_MOE_GEMM_MIN") != NULL ?
+                         (uint32_t)atoi(getenv("DS4_GLM_MOE_GEMM_MIN")) : 128u) &&
             l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS &&
             getenv("DS4_GLM_NO_MOE_GEMM") == NULL &&
             ds4_gpu_glm_routed_moe_batch_gemm_tensor(
@@ -40976,10 +40977,22 @@ static bool glm_graph_encode_sparse_ffn_one(
     const bool tp_split_ffn = g->tp_world == 2 && g->tp_out && g->tp_in;
     const uint32_t tp_ffn_slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
     ds4_gpu_tensor *routed_dst = tp_split_ffn ? g->tp_out[tp_ffn_slot] : ffn_out;
+#if defined(__APPLE__)
     if (ok && tp_split_ffn && g->ssd_streaming) {
         fprintf(stderr, "ds4: GLM tensor parallelism requires resident weights\n");
         ok = false;
     }
+#else
+    /* CUDA GLM TP runs with the streamed expert tail: staging nulls the
+     * peer-owned slots and the routed kernels skip them (ds4_cuda.cu), so
+     * each rank's routed output is already its owned partial.
+     * DS4_GLM_TP_NO_STREAMED_TAIL restores the resident-only rule. */
+    if (ok && tp_split_ffn && g->ssd_streaming &&
+        getenv("DS4_GLM_TP_NO_STREAMED_TAIL") != NULL) {
+        fprintf(stderr, "ds4: GLM tensor parallelism requires resident weights\n");
+        ok = false;
+    }
+#endif
     if (!ok && tp_split_ffn && getenv("DS4_GLM_TP_DEBUG")) {
         fprintf(stderr, "ds4: glm sparse ffn: failed before routed dispatch (layer %u)\n", il);
     }
@@ -57358,7 +57371,7 @@ int ds4_engine_tp_vocab_split(ds4_engine *e) {
     return e && e->tp.active && e->tp.vocab_split;
 }
 
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
 static int ds4_engine_tp_exchange(void *ud, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp *tp = ud;
     const int ok = ds4_tp_gate_exchange(tp, layer, gate, seq);
@@ -57394,13 +57407,13 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
 #endif
 
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen) {
-#if defined(DS4_NO_GPU) || !defined(__APPLE__)
+#if defined(DS4_NO_GPU) || defined(DS4_ROCM_BUILD)
     (void)e; (void)tp;
-    snprintf(err, errlen, "tensor parallelism requires the Metal backend");
+    snprintf(err, errlen, "tensor parallelism requires the Metal or CUDA backend");
     return 0;
 #else
-    if (e->backend != DS4_BACKEND_METAL) {
-        snprintf(err, errlen, "tensor parallelism requires the Metal backend");
+    if (e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA) {
+        snprintf(err, errlen, "tensor parallelism requires the Metal or CUDA backend");
         return 0;
     }
     if (e->tp.active) {
@@ -57410,8 +57423,11 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
     const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t slab_bytes = ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);
-    e->tp.slab = ds4_gpu_tensor_alloc(slab_bytes);
-    e->tp.zero_vec = ds4_gpu_tensor_alloc(vec_bytes);
+    /* The slab must be CPU-visible without a device sync: the transport
+     * and the gate service thread read and write it directly (on Metal
+     * every buffer is shared; on CUDA this maps pinned host memory). */
+    e->tp.slab = ds4_gpu_tensor_alloc_shared(slab_bytes);
+    e->tp.zero_vec = ds4_gpu_tensor_alloc_shared(vec_bytes);
     e->tp.out_views = calloc(slots, sizeof(*e->tp.out_views));
     e->tp.in_views = calloc(slots, sizeof(*e->tp.in_views));
     e->tp.batch_out_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_out_views));
@@ -57481,7 +57497,7 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
     if (e->tp.active) {
         ds4_gpu_tp_shutdown();
         const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
@@ -57725,7 +57741,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->glm_graph.quality = e->quality;
         s->glm_graph.ssd_streaming = e->ssd_streaming;
         s->glm_graph.ssd_streaming_cold = e->ssd_streaming_cold;
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
         if (e->tp.active) {
             s->glm_graph.tp_world = 2;
             s->glm_graph.tp_rank = (uint32_t)e->tp.rank;
@@ -60796,7 +60812,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         ds4_session_invalidate(s);
         return rc;
     }
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
     if (rc == 0 && s->engine && s->engine->tp.active && ds4_gpu_tp_failed()) {
         snprintf(err, errlen, "tp: gate transport failed");
         if (ds4_session_tp_leader(s)) ds4_session_invalidate(s);
