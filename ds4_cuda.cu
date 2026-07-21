@@ -17186,10 +17186,10 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     if (expert_i < 0) expert_i = 0;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
-    __shared__ cuda_block_q8_K sxq[16];
+    __shared__ cuda_block_q8_K sxq[24];
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
-    if (xq_blocks <= 16u) {
+    if (xq_blocks <= 24u) {
         for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
         for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
         for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
@@ -17250,10 +17250,10 @@ __global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
     if (!moe_owned_local_expert(selected[pair], expert_base, expert_count,
                                 &expert)) return;
     const cuda_block_q8_K *xqb = xq;
-    __shared__ cuda_block_q8_K sxq[16];
+    __shared__ cuda_block_q8_K sxq[24];
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
-    if (xq_blocks <= 16u) {
+    if (xq_blocks <= 24u) {
         for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
         for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
         for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
@@ -18789,6 +18789,51 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile8_rowspan_kernel(
             }
         }
     }
+}
+
+
+/* GLM decode: direct down-sum across the 8 selected IQ2_XXS experts with
+ * the codebook staged in shared memory (divergent __constant__ lookups are
+ * the IQ2 decode bottleneck). owned_mask bit s clears slot s for the TP
+ * expert-ownership split; pass 0xff when unsplit. */
+__global__ static void moe_down_sum8_iq2xxs_lut_qwarp32_kernel(
+        float *out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t owned_mask) {
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x)
+        s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x)
+        s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= out_dim) return;
+    float total = 0.0f;
+#pragma unroll
+    for (uint32_t slot = 0; slot < 8u; slot++) {
+        if (!((owned_mask >> slot) & 1u)) continue;
+        int32_t expert_i = selected[slot];
+        if (expert_i < 0) continue;
+        const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)
+            (down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+             (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u)
+            acc += dev_dot_iq2_xxs_q8_K_block_lut(wr + b, xq + b,
+                                                  s_iq2_grid, s_iq2_signs);
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) total += acc;
+    }
+    if (lane == 0) out[row] = total;
 }
 
 __global__ static void moe_down_sum6_qwarp32_kernel(
@@ -21093,7 +21138,7 @@ static int routed_moe_launch(
         const uint32_t use_q4_down_rowspan = q4k_path && use_expert_tiles && expert_tile_m == 8u &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_Q4_DOWN_ROWSPAN") == NULL;
         const uint32_t use_decode_lut_gate =
-            n_tokens == 1u && xq_blocks <= 16u &&
+            n_tokens == 1u && xq_blocks <= 24u &&
             getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL;
         const uint32_t gate_row_span =
             getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ? 2048u :
@@ -21113,8 +21158,9 @@ static int routed_moe_launch(
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW128") == NULL &&
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW64") == NULL));
         const uint32_t use_direct_down_sum =
-            !iq2_down_path &&
-            n_tokens == 1u && (n_expert == 6u || n_expert == 3u) &&
+            n_tokens == 1u &&
+            ((!iq2_down_path && (n_expert == 6u || n_expert == 3u)) ||
+             (iq2_down_path && n_expert == 8u)) &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
         const uint32_t use_direct_midq =
             q4k_path && use_direct_down_sum && !write_gate_up &&
@@ -21759,7 +21805,18 @@ static int routed_moe_launch(
                         }
                     }
                 } else {
-                    if (n_expert == 6u) {
+                    if (iq2_down_path && n_expert == 8u) {
+                        moe_down_sum8_iq2xxs_lut_qwarp32_kernel<<<sgrid, 256>>>(
+                            (float *)out->ptr,
+                            down_w,
+                            midq,
+                            (const int32_t *)selected->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            0xffu);
+                    } else if (n_expert == 6u) {
                         moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
                             (float *)out->ptr,
                             down_w,
