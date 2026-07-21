@@ -45950,7 +45950,52 @@ static bool glm_graph_forward_token(
                                               g->heads_dim,
                                               il,
                                               pos);
-        if (ok && !(decode_ablate & DS4_GLM_ABLATE_ATTN_OUT)) {
+        const bool tp_split_attn = g->tp_world == 2 && g->tp_out && g->tp_in &&
+            il >= DS4_N_LEADING_DENSE &&
+            il < DS4_N_LAYER - DS4_N_NEXTN_PREDICT &&
+            getenv("DS4_GLM_TP_ATTN_SPLIT") != NULL;
+        if (ok && tp_split_attn && !(decode_ablate & DS4_GLM_ABLATE_ATTN_OUT)) {
+            /* 50/50 attention head split, v1: both ranks still compute
+             * every head, but the output projection reads only this
+             * rank's half of the heads buffer (k-slice partial into the
+             * slab out slot); the ATTN gate exchanges the halves and the
+             * commutative add rebuilds the full projection identically
+             * on both ranks.  Restricting the upstream q/attention
+             * kernels to the owned head range is a follow-on
+             * optimization - the partial is already exact. */
+            const uint32_t tp_attn_slot =
+                il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN;
+            const uint64_t low_cnt =
+                ((uint64_t)DS4_N_HEAD / 2u) * (uint64_t)DS4_N_VALUE_MLA;
+            const uint64_t k_off = g->tp_rank == 1 ? low_cnt : 0u;
+            const uint64_t k_cnt = g->tp_rank == 1 ?
+                (uint64_t)g->heads_dim - low_cnt : low_cnt;
+            ds4_gpu_tensor *hx = ds4_gpu_tensor_view(
+                    g->heads, k_off * sizeof(float), k_cnt * sizeof(float));
+            ok = hx != NULL;
+            if (ok) {
+                ok = ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+                        g->tp_out[tp_attn_slot],
+                        model->map,
+                        model->size,
+                        l->attn_output->abs_offset,
+                        g->heads_dim,
+                        DS4_N_EMBD,
+                        k_off,
+                        k_cnt,
+                        hx,
+                        1) != 0;
+                ds4_gpu_tensor_free(hx);
+            }
+            if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ATTN) != 0;
+            if (ok) ok = ds4_gpu_add_tensor(g->attn_out,
+                                            g->tp_out[tp_attn_slot],
+                                            g->tp_in[tp_attn_slot],
+                                            DS4_N_EMBD) != 0;
+            if (!ok) fprintf(stderr,
+                             "ds4: GLM TP attn gate/combine failed (layer %u)\n",
+                             il);
+        } else if (ok && !(decode_ablate & DS4_GLM_ABLATE_ATTN_OUT)) {
             ok = glm_graph_matmul_q8_0_decode_profiled_tensor(g->attn_out,
                                                               model,
                                                               l->attn_output->abs_offset,
@@ -56350,6 +56395,15 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *per_token) {
     (void)e;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        if (getenv("DS4_GLM_TP_ATTN_SPLIT") != NULL) {
+            /* Attention split: every sparse layer fires ATTN then FFN,
+             * so the slots are contiguous from the first sparse layer. */
+            *start = DS4_N_LEADING_DENSE * DS4_TP_GATES_PER_LAYER;
+            *step = 1;
+            *per_token = (DS4_N_LAYER - DS4_N_NEXTN_PREDICT -
+                          DS4_N_LEADING_DENSE) * DS4_TP_GATES_PER_LAYER;
+            return;
+        }
         /* One FFN gate per sparse layer of the NORMAL pass: the leading
          * dense blocks fire nothing and the trailing nextn/MTP block is
          * not part of the decode pass at all. */
