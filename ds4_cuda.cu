@@ -157,6 +157,177 @@ typedef struct {
 
 static cuda_stream_selected_cache g_stream_selected_cache;
 
+/* Persistent device-side expert LRU pool behind the per-layer selected
+ * scratch.  The scratch above is rebuilt every layer call; without a
+ * pool every selected expert re-copies ~9 MiB from the page cache each
+ * layer each token (~5-7 ms/layer, the decode bottleneck under SSD
+ * streaming).  The pool keeps staged experts keyed by (layer, expert)
+ * in device memory sized by --ssd-streaming-cache-experts: hits become
+ * device-to-device copies into the scratch, misses fill a pool slot
+ * first (clock eviction).  Grown in chunks so no single allocation
+ * burst can trip the GB10 kernel OOM killer. */
+enum { CUDA_EXPERT_POOL_CHUNK = 256u };
+
+typedef struct {
+    int valid;
+    uint32_t slots;         /* allocated so far (multiple of chunk) */
+    uint32_t budget;        /* max slots */
+    uint32_t clock_hand;
+    uint64_t gate_bytes;    /* per-expert size class */
+    uint64_t down_bytes;
+    uint64_t hits;
+    uint64_t misses;
+    std::vector<char *> gate_chunks;
+    std::vector<char *> up_chunks;
+    std::vector<char *> down_chunks;
+    std::vector<uint32_t> slot_key;   /* slot -> key, UINT32_MAX = free */
+    std::vector<uint8_t> slot_used;   /* clock reference bits */
+    std::unordered_map<uint32_t, uint32_t> key_to_slot;
+} cuda_expert_pool;
+
+static cuda_expert_pool g_expert_pool;
+static uint32_t g_expert_pool_budget_cfg;
+
+static void cuda_expert_pool_release(void) {
+    for (char *p : g_expert_pool.gate_chunks) (void)cudaFree(p);
+    for (char *p : g_expert_pool.up_chunks) (void)cudaFree(p);
+    for (char *p : g_expert_pool.down_chunks) (void)cudaFree(p);
+    g_expert_pool.gate_chunks.clear();
+    g_expert_pool.up_chunks.clear();
+    g_expert_pool.down_chunks.clear();
+    g_expert_pool.slot_key.clear();
+    g_expert_pool.slot_used.clear();
+    g_expert_pool.key_to_slot.clear();
+    g_expert_pool.slots = 0;
+    g_expert_pool.budget = 0;
+    g_expert_pool.clock_hand = 0;
+    g_expert_pool.hits = 0;
+    g_expert_pool.misses = 0;
+    g_expert_pool.valid = 0;
+}
+
+static char *cuda_expert_pool_ptr(std::vector<char *> &chunks, uint32_t slot,
+                                  uint64_t expert_bytes) {
+    return chunks[slot / CUDA_EXPERT_POOL_CHUNK] +
+           (uint64_t)(slot % CUDA_EXPERT_POOL_CHUNK) * expert_bytes;
+}
+
+static int cuda_expert_pool_ensure(uint32_t n_total_expert, uint32_t layer,
+                                   uint64_t gate_expert_bytes,
+                                   uint64_t down_expert_bytes) {
+    if (getenv("DS4_CUDA_NO_EXPERT_POOL") != NULL) return 0;
+    if (n_total_expert > 256u || layer >= 512u) return 0;
+    if (g_expert_pool.valid &&
+        (g_expert_pool.gate_bytes != gate_expert_bytes ||
+         g_expert_pool.down_bytes != down_expert_bytes)) {
+        /* Off-size-class layer (mixed-precision model): serve it through
+         * the direct path, keep the pool for the uniform layers. */
+        return 0;
+    }
+    if (!g_expert_pool.valid) {
+        const uint32_t budget = g_expert_pool_budget_cfg ?
+                g_expert_pool_budget_cfg : 2048u;
+        g_expert_pool.budget = budget;
+        g_expert_pool.gate_bytes = gate_expert_bytes;
+        g_expert_pool.down_bytes = down_expert_bytes;
+        g_expert_pool.slots = 0;
+        g_expert_pool.clock_hand = 0;
+        g_expert_pool.valid = 1;
+    }
+    return g_expert_pool.budget > 0u;
+}
+
+/* Add one chunk of slots; on allocation failure freeze the budget at the
+ * current size instead of failing the layer (gradual, guarded growth). */
+static int cuda_expert_pool_grow(void) {
+    if (g_expert_pool.slots >= g_expert_pool.budget) return 0;
+    char *gate = NULL, *up = NULL, *down = NULL;
+    const uint64_t gb = (uint64_t)CUDA_EXPERT_POOL_CHUNK * g_expert_pool.gate_bytes;
+    const uint64_t db = (uint64_t)CUDA_EXPERT_POOL_CHUNK * g_expert_pool.down_bytes;
+    if (cudaMalloc((void **)&gate, (size_t)gb) != cudaSuccess ||
+        cudaMalloc((void **)&up, (size_t)gb) != cudaSuccess ||
+        cudaMalloc((void **)&down, (size_t)db) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (gate) (void)cudaFree(gate);
+        if (up) (void)cudaFree(up);
+        fprintf(stderr,
+                "ds4: CUDA expert pool growth stopped at %u slots "
+                "(allocation failed; budget was %u)\n",
+                g_expert_pool.slots, g_expert_pool.budget);
+        g_expert_pool.budget = g_expert_pool.slots;
+        return 0;
+    }
+    g_expert_pool.gate_chunks.push_back(gate);
+    g_expert_pool.up_chunks.push_back(up);
+    g_expert_pool.down_chunks.push_back(down);
+    const uint32_t base = g_expert_pool.slots;
+    g_expert_pool.slots += CUDA_EXPERT_POOL_CHUNK;
+    if (g_expert_pool.slots > g_expert_pool.budget)
+        g_expert_pool.slots = g_expert_pool.budget;
+    g_expert_pool.slot_key.resize(g_expert_pool.slots, UINT32_MAX);
+    g_expert_pool.slot_used.resize(g_expert_pool.slots, 0);
+    (void)base;
+    return 1;
+}
+
+/* Find or claim a pool slot for key.  Returns 0 only when the pool has
+ * no usable slots at all. */
+static int cuda_expert_pool_acquire(uint32_t key, uint32_t *slot_out,
+                                    int *hit_out) {
+    auto it = g_expert_pool.key_to_slot.find(key);
+    if (it != g_expert_pool.key_to_slot.end()) {
+        g_expert_pool.slot_used[it->second] = 1;
+        g_expert_pool.hits++;
+        *slot_out = it->second;
+        *hit_out = 1;
+        return 1;
+    }
+    g_expert_pool.misses++;
+    *hit_out = 0;
+    /* Free slot from an unfilled chunk, or grow, or clock-evict. */
+    uint32_t slot = UINT32_MAX;
+    if (g_expert_pool.key_to_slot.size() < g_expert_pool.slots) {
+        for (uint32_t i = 0; i < g_expert_pool.slots; i++) {
+            if (g_expert_pool.slot_key[i] == UINT32_MAX) { slot = i; break; }
+        }
+    }
+    if (slot == UINT32_MAX &&
+        g_expert_pool.slots < g_expert_pool.budget &&
+        cuda_expert_pool_grow()) {
+        for (uint32_t i = 0; i < g_expert_pool.slots; i++) {
+            if (g_expert_pool.slot_key[i] == UINT32_MAX) { slot = i; break; }
+        }
+    }
+    if (slot == UINT32_MAX) {
+        if (g_expert_pool.slots == 0) return 0;
+        uint32_t scanned = 0;
+        const uint32_t n = g_expert_pool.slots;
+        while (scanned < 2u * n) {
+            const uint32_t cand = g_expert_pool.clock_hand;
+            g_expert_pool.clock_hand = (cand + 1u) % n;
+            scanned++;
+            if (g_expert_pool.slot_used[cand]) {
+                g_expert_pool.slot_used[cand] = 0;
+                continue;
+            }
+            slot = cand;
+            break;
+        }
+        if (slot == UINT32_MAX) {
+            slot = g_expert_pool.clock_hand;
+            g_expert_pool.clock_hand =
+                    (g_expert_pool.clock_hand + 1u) % n;
+        }
+        if (g_expert_pool.slot_key[slot] != UINT32_MAX)
+            g_expert_pool.key_to_slot.erase(g_expert_pool.slot_key[slot]);
+    }
+    g_expert_pool.slot_key[slot] = key;
+    g_expert_pool.slot_used[slot] = 1;
+    g_expert_pool.key_to_slot[key] = slot;
+    *slot_out = slot;
+    return 1;
+}
+
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
 }
@@ -2833,6 +3004,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
     }
     cuda_stream_selected_cache_release();
+    cuda_expert_pool_release();
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
     g_cublas_ready = 0;
@@ -3735,6 +3907,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_stream_selected_cache_release();
+    cuda_expert_pool_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -3840,6 +4013,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
 
     cuda_stream_selected_cache_release();
+    cuda_expert_pool_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -26275,6 +26449,10 @@ static int cuda_stream_selected_cache_begin_load(
         return 0;
     }
 
+    const int pool_ok = cuda_expert_pool_ensure(table->n_total_expert,
+                                                table->layer,
+                                                table->gate_expert_bytes,
+                                                table->down_expert_bytes);
     for (uint32_t i = 0; i < compact_ids.size(); i++) {
         const uint64_t expert = (uint32_t)compact_ids[i];
         const uint64_t gate_src =
@@ -26285,6 +26463,56 @@ static int cuda_stream_selected_cache_begin_load(
             table->down_offset + expert * table->down_expert_bytes;
         const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
         const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
+        uint32_t slot = 0;
+        int hit = 0;
+        if (pool_ok &&
+            cuda_expert_pool_acquire(table->layer * 256u + (uint32_t)expert,
+                                     &slot, &hit)) {
+            char *pg = cuda_expert_pool_ptr(g_expert_pool.gate_chunks, slot,
+                                            g_expert_pool.gate_bytes);
+            char *pu = cuda_expert_pool_ptr(g_expert_pool.up_chunks, slot,
+                                            g_expert_pool.gate_bytes);
+            char *pd = cuda_expert_pool_ptr(g_expert_pool.down_chunks, slot,
+                                            g_expert_pool.down_bytes);
+            if (!hit) {
+                if (!cuda_model_copy_to_device_streamed(
+                            pg, table->model_map, table->model_size,
+                            gate_src, table->gate_expert_bytes,
+                            "pool gate expert fill") ||
+                    !cuda_model_copy_to_device_streamed(
+                            pu, table->model_map, table->model_size,
+                            up_src, table->gate_expert_bytes,
+                            "pool up expert fill") ||
+                    !cuda_model_copy_to_device_streamed(
+                            pd, table->model_map, table->model_size,
+                            down_src, table->down_expert_bytes,
+                            "pool down expert fill")) {
+                    g_expert_pool.slot_key[slot] = UINT32_MAX;
+                    g_expert_pool.key_to_slot.erase(
+                            table->layer * 256u + (uint32_t)expert);
+                    cuda_stream_selected_cache_invalidate();
+                    return 0;
+                }
+            }
+            /* Device-to-device gather into the compact scratch on the
+             * legacy stream: ordered ahead of the consuming kernels, no
+             * host sync needed.  Scratch keeps its own copy, so later
+             * eviction of this slot can never affect in-flight reads. */
+            if (cudaMemcpyAsync(g_stream_selected_cache.gate_ptr + gate_dst,
+                                pg, (size_t)table->gate_expert_bytes,
+                                cudaMemcpyDeviceToDevice, 0) != cudaSuccess ||
+                cudaMemcpyAsync(g_stream_selected_cache.up_ptr + gate_dst,
+                                pu, (size_t)table->gate_expert_bytes,
+                                cudaMemcpyDeviceToDevice, 0) != cudaSuccess ||
+                cudaMemcpyAsync(g_stream_selected_cache.down_ptr + down_dst,
+                                pd, (size_t)table->down_expert_bytes,
+                                cudaMemcpyDeviceToDevice, 0) != cudaSuccess) {
+                (void)cudaGetLastError();
+                cuda_stream_selected_cache_invalidate();
+                return 0;
+            }
+            continue;
+        }
         if (!cuda_model_copy_to_device_streamed(
                     g_stream_selected_cache.gate_ptr + gate_dst,
                     table->model_map, table->model_size,
@@ -26302,6 +26530,18 @@ static int cuda_stream_selected_cache_begin_load(
                     "stream down expert copy")) {
             cuda_stream_selected_cache_invalidate();
             return 0;
+        }
+    }
+    if (pool_ok && getenv("DS4_CUDA_EXPERT_POOL_STATS") != NULL) {
+        const uint64_t total = g_expert_pool.hits + g_expert_pool.misses;
+        if (total > 0 && total % 4096u < compact_ids.size()) {
+            fprintf(stderr,
+                    "ds4: CUDA expert pool: %llu lookups, %.1f%% hits, "
+                    "%u/%u slots\n",
+                    (unsigned long long)total,
+                    100.0 * (double)g_expert_pool.hits / (double)total,
+                    (uint32_t)g_expert_pool.key_to_slot.size(),
+                    g_expert_pool.slots);
         }
     }
     if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
@@ -31473,19 +31713,24 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_stream_selected_cache_invalidate();
-    if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
+    if (!g_ssd_streaming_mode) {
+        cuda_stream_selected_cache_release();
+        cuda_expert_pool_release();
+    }
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
-    (void)experts;
+    g_expert_pool_budget_cfg = experts;
+    if (g_expert_pool.valid && experts < g_expert_pool.budget)
+        g_expert_pool.budget = experts;
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
-    (void)bytes;
+    (void)bytes;   /* size class comes from the stream table at first use */
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
-    return 0;
+    return g_expert_pool.valid ? g_expert_pool.budget : 0;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
