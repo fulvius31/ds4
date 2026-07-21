@@ -495,11 +495,15 @@ int ds4_tp_validate_engine_options(
         }
         return 1;
     }
-    if (opt->backend != DS4_BACKEND_METAL) {
-        tp_set_err(err, errlen, "tensor parallelism requires the Metal backend");
+    if (opt->backend != DS4_BACKEND_METAL && opt->backend != DS4_BACKEND_CUDA) {
+        tp_set_err(err, errlen, "tensor parallelism requires the Metal or CUDA backend");
         return 0;
     }
-    if (opt->ssd_streaming) {
+    if (opt->ssd_streaming && opt->backend != DS4_BACKEND_CUDA) {
+        /* CUDA GLM TP runs with a partially-streamed expert tail: the full
+         * TP-resident weight set (108 GiB per box) does not fit the GB10
+         * ceiling, so the expert cache streams the cold remainder.  Metal
+         * TP keeps the resident-weights requirement. */
         tp_set_err(err, errlen, "tensor parallelism requires resident weights (no --ssd-streaming)");
         return 0;
     }

@@ -46,6 +46,10 @@ void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
+/* CPU-visible + GPU-visible allocation (TP slab / bounce buffers).  Metal
+ * buffers are storage-mode shared already; CUDA uses pinned host-mapped
+ * memory so the TP service thread can read it without any CUDA call. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_shared(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
