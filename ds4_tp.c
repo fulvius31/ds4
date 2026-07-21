@@ -29,7 +29,7 @@
 
 #include "ds4_tp.h"
 
-#if defined(__APPLE__) && defined(__has_include)
+#if defined(__has_include)
 #if __has_include(<infiniband/verbs.h>)
 #include <infiniband/verbs.h>
 #include <dlfcn.h>
@@ -125,7 +125,11 @@ typedef struct {
  * (86 gates per token, fixed order). After any initial bulk prefill, decode
  * keeps a receive window posted by sequence number: recv for seq s lands in
  * the slab in-slot (s-1) % slots and its completion IS the arrival signal. */
-#define DS4_TP_RDMA_MAX_MSG 16384
+/* 32 KiB keeps a full GLM gate vector (24576 B) in one message; the
+ * 2-chunk path exists but the recv-window accounting is simplest and
+ * best-tested at one completion per gate.  RoCE message limits are far
+ * above this; the old 16384 came from the Thunderbolt-era sizing. */
+#define DS4_TP_RDMA_MAX_MSG 32768
 #define DS4_TP_RDMA_RECV_WINDOW 16
 #define DS4_TP_RDMA_BULK_SLOTS 64
 #define DS4_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
@@ -586,8 +590,13 @@ uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer) {
 
 static int tp_rdma_load_api(ds4_tp_verbs_api *api) {
     if (api->handle) return 1;
+#ifdef __APPLE__
     void *h = dlopen("/usr/lib/librdma.dylib", RTLD_NOW | RTLD_LOCAL);
     if (!h) h = dlopen("librdma.dylib", RTLD_NOW | RTLD_LOCAL);
+#else
+    void *h = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!h) h = dlopen("libibverbs.so", RTLD_NOW | RTLD_LOCAL);
+#endif
     if (!h) return 0;
 #define TP_SYM(field, name) \
     do { \
@@ -712,7 +721,18 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     struct ibv_qp_init_attr qia = {0};
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
+    /* Apple's Thunderbolt driver only implements UC (RC/UD: ENOTSUP), and
+     * the gate protocol tolerates that because Thunderbolt never drops.
+     * Real RoCE without PFC does drop occasionally, and on UC every lost
+     * message shifts the send<->recv pairing until the receive window
+     * deadlocks (observed: out_of_sequence counter ticking, both ranks
+     * stalling near gate ~1125).  RC's hardware retransmit removes the
+     * whole failure class, so it is the default off-Apple. */
+#ifdef __APPLE__
     qia.qp_type = IBV_QPT_UC;
+#else
+    qia.qp_type = IBV_QPT_RC;
+#endif
     qia.cap.max_send_wr = 256;
     qia.cap.max_recv_wr = 64;
     qia.cap.max_send_sge = 1;
@@ -720,7 +740,7 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     qia.cap.max_inline_data = 0;
     r->qp = r->api.create_qp(r->pd, &qia);
     if (!r->qp) {
-        tp_set_err(err, errlen, "tp rdma: create_qp(UC): %s", strerror(errno));
+        tp_set_err(err, errlen, "tp rdma: create_qp: %s", strerror(errno));
         return 0;
     }
     r->max_inline = qia.cap.max_inline_data;
@@ -786,6 +806,7 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
     a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
     a.ah_attr.grh.hop_limit = 1;
+#ifdef __APPLE__
     if (r->api.modify_qp(r->qp, &a,
             IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
             IBV_QP_RQ_PSN) != 0) {
@@ -799,6 +820,32 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
         return 0;
     }
+#else
+    /* RC transitions carry the reliability knobs UC lacks. */
+    a.max_dest_rd_atomic = 1;
+    a.min_rnr_timer = 12;           /* 0.64 ms between RNR retries */
+    if (r->api.modify_qp(r->qp, &a,
+            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+            IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
+            IBV_QP_MIN_RNR_TIMER) != 0) {
+        tp_set_err(err, errlen, "tp rdma: modify RTR: %s", strerror(errno));
+        return 0;
+    }
+    memset(&a, 0, sizeof(a));
+    a.qp_state = IBV_QPS_RTS;
+    a.sq_psn = mine.psn;
+    a.timeout = 14;                 /* ~67 ms ack timeout */
+    a.retry_cnt = 7;
+    a.rnr_retry = 7;                /* retry RNR forever; window pre-posts */
+    a.max_rd_atomic = 1;
+    if (r->api.modify_qp(r->qp, &a,
+            IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
+            IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+            IBV_QP_MAX_QP_RD_ATOMIC) != 0) {
+        tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
+        return 0;
+    }
+#endif
     if (tp->vec_bytes > 2ull * DS4_TP_RDMA_MAX_MSG) {
         tp_set_err(err, errlen,
                    "tp rdma: gate vector %llu bytes exceeds twice the driver's "
