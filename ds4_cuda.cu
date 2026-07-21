@@ -26155,6 +26155,12 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_gemm_tensor(
         !g_cublas_ready) {
         return 0;
     }
+    /* Streaming resolves these spans to file-backed mmap AND the selected
+     * cache has already staged (and dropped the file pages of) the experts
+     * this chunk needs, so running the dequant here would re-fault the
+     * whole layer from disk. Use the dot kernels until the cache-aware
+     * GEMM variant (dequant from the staged expert-major cache) lands. */
+    if (g_ssd_streaming_mode) return 0;
     const uint32_t pair_count = n_tokens * n_expert;
     if (down->bytes < (uint64_t)pair_count * out_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
@@ -26221,21 +26227,36 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_gemm_tensor(
     moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
             sorted, cursors, (const int32_t *)selected->ptr, pair_count,
             n_total_expert);
-    {
-        const uint64_t n = (uint64_t)pair_count * expert_in_dim;
-        glm_moe_gemm_gather_x_f16_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
-                xg, (const float *)x->ptr, sorted, pair_count, expert_in_dim,
-                n_expert);
-    }
     if (!cuda_ok(cudaGetLastError(), "glm gemm grouping launch")) return 0;
 
-    /* Host copy of expert offsets to drive the per-expert loop. */
+    /* Read offsets back BEFORE consuming `sorted`: if the router emitted any
+     * masked/invalid expert ids the scatter leaves tail entries of `sorted`
+     * uninitialized, and the gather/scatter kernels below would read garbage
+     * pair ids and write out of bounds. Validate full coverage instead. */
     uint32_t *h_offsets = (uint32_t *)malloc(offsets_b);
     if (!h_offsets) return 0;
     if (!cuda_ok(cudaMemcpy(h_offsets, offsets, offsets_b,
                             cudaMemcpyDeviceToHost), "glm gemm offsets read")) {
         free(h_offsets);
         return 0;
+    }
+    if (h_offsets[n_total_expert] != pair_count) {
+        fprintf(stderr,
+                "ds4: glm moe gemm: %u of %u pairs carry invalid expert ids; "
+                "falling back to the reference kernels\n",
+                pair_count - h_offsets[n_total_expert], pair_count);
+        free(h_offsets);
+        return 0;
+    }
+    {
+        const uint64_t n = (uint64_t)pair_count * expert_in_dim;
+        glm_moe_gemm_gather_x_f16_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
+                xg, (const float *)x->ptr, sorted, pair_count, expert_in_dim,
+                n_expert);
+        if (!cuda_ok(cudaGetLastError(), "glm gemm gather launch")) {
+            free(h_offsets);
+            return 0;
+        }
     }
 
     cublasHandle_t handle = cuda_cublas_for_tier(logical_tier);
