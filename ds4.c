@@ -40187,6 +40187,17 @@ static bool glm_graph_encode_sparse_ffn_one(
             }
         }
     }
+    /* Shared-expert split: with the FFN gate already exchanging the
+     * routed partial, each rank can compute a k-slice of the shared down
+     * projection over its half of the mid activations and add that
+     * partial into the SAME slab slot before the gate fires - the
+     * exchange carries routed+shared for free.  The gate/up/swiglu stays
+     * replicated (cheap), and ffn_sum is zeroed afterwards so the
+     * downstream residual math is untouched. */
+    const bool tp_split_shared_pre = g->tp_world == 2 && g->tp_out && g->tp_in &&
+        shared_first &&
+        ((DS4_N_FF_EXP / 2u) % 32u) == 0u &&
+        getenv("DS4_GLM_TP_SHARED_SPLIT") != NULL;
     if (ok && shared_first) {
         ok = glm_graph_encode_shared_swiglu_one(ffn_mid,
                                                 ffn_gate,
@@ -40199,16 +40210,40 @@ static bool glm_graph_encode_sparse_ffn_one(
                                                 g->ssd_streaming,
                                                 stage_profile,
                                                 stage_t0);
-        if (ok) ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_sum,
-                                                                  model,
-                                                                  l->ffn_down_shexp->abs_offset,
-                                                                  DS4_N_FF_EXP,
-                                                                  DS4_N_EMBD,
-                                                                  ffn_mid,
-                                                                  il,
-                                                                  pos,
-                                                                  "shared_down",
-                                                                  g->ssd_streaming) != 0;
+        if (ok && tp_split_shared_pre) {
+            const uint64_t sh_low = (uint64_t)DS4_N_FF_EXP / 2u;
+            const uint64_t sh_off = g->tp_rank == 1 ? sh_low : 0u;
+            const uint64_t sh_cnt = g->tp_rank == 1 ?
+                (uint64_t)DS4_N_FF_EXP - sh_low : sh_low;
+            ds4_gpu_tensor *mx = ds4_gpu_tensor_view(
+                    ffn_mid, sh_off * sizeof(float), sh_cnt * sizeof(float));
+            ok = mx != NULL;
+            if (ok) {
+                ok = ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+                        ffn_sum,
+                        model->map,
+                        model->size,
+                        l->ffn_down_shexp->abs_offset,
+                        DS4_N_FF_EXP,
+                        DS4_N_EMBD,
+                        sh_off,
+                        sh_cnt,
+                        mx,
+                        1) != 0;
+                ds4_gpu_tensor_free(mx);
+            }
+        } else if (ok) {
+            ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_sum,
+                                                              model,
+                                                              l->ffn_down_shexp->abs_offset,
+                                                              DS4_N_FF_EXP,
+                                                              DS4_N_EMBD,
+                                                              ffn_mid,
+                                                              il,
+                                                              pos,
+                                                              "shared_down",
+                                                              g->ssd_streaming) != 0;
+        }
         if (ok) ok = glm_graph_profile_stage(stage_profile,
                                              "glm_decode_ffn",
                                              "shared_down",
@@ -40293,7 +40328,18 @@ static bool glm_graph_encode_sparse_ffn_one(
             resident_decode_layer) != 0;
     }
     if (ok && tp_split_ffn) {
-        ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
+        if (tp_split_shared_pre) {
+            /* Fold this rank's shared-down partial into the routed slab
+             * slot so the FFN gate exchanges routed+shared together;
+             * zero ffn_sum so the residual path does not add it again. */
+            ok = ds4_gpu_add_tensor(g->tp_out[tp_ffn_slot],
+                                    g->tp_out[tp_ffn_slot],
+                                    ffn_sum,
+                                    DS4_N_EMBD) != 0;
+            if (ok) ok = ds4_gpu_tensor_fill_f32(ffn_sum, 0.0f,
+                                                 DS4_N_EMBD) != 0;
+        }
+        if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
         if (ok) ok = ds4_gpu_add_tensor(ffn_out,
                                         g->tp_out[tp_ffn_slot],
                                         g->tp_in[tp_ffn_slot],
