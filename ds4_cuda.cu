@@ -26587,27 +26587,61 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_gemm_tensor(
         !g_cublas_ready) {
         return 0;
     }
-    /* Streaming resolves these spans to file-backed mmap AND the selected
-     * cache has already staged (and dropped the file pages of) the experts
-     * this chunk needs, so running the dequant here would re-fault the
-     * whole layer from disk. Use the dot kernels until the cache-aware
-     * GEMM variant (dequant from the staged expert-major cache) lands. */
-    if (g_ssd_streaming_mode) return 0;
     const uint32_t pair_count = n_tokens * n_expert;
     if (down->bytes < (uint64_t)pair_count * out_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
     }
     const int logical_tier = ds4_tensor_device_idx(out);
-    const char *gate_w = cuda_resolve_weight_ptr(model_map, gate_offset,
-            (uint64_t)n_total_expert * gate_expert_bytes, logical_tier,
-            "glm_gemm_gate");
-    const char *up_w = cuda_resolve_weight_ptr(model_map, up_offset,
-            (uint64_t)n_total_expert * up_expert_bytes, logical_tier,
-            "glm_gemm_up");
-    const char *down_w = cuda_resolve_weight_ptr(model_map, down_offset,
-            (uint64_t)n_total_expert * down_expert_bytes, logical_tier,
-            "glm_gemm_down");
+    /* Cache-aware variant: under SSD streaming the batch staging has
+     * already gathered this chunk's experts into the compact device
+     * cache (and dropped the file pages), so the dequant reads the
+     * cache instead of re-faulting the layer from disk.  The expert id
+     * space becomes the compact slot table - which also carries the TP
+     * ownership filter (peer-owned slots are -1), so under the 50/50
+     * split this GEMM naturally computes the owned partial. */
+    const int use_staged =
+        g_ssd_streaming_mode &&
+        g_stream_selected_cache.valid &&
+        g_stream_selected_cache.logical_tier == logical_tier &&
+        g_stream_selected_cache.model_map == model_map &&
+        g_stream_selected_cache.layer == layer_index &&
+        g_stream_selected_cache.n_total_expert == n_total_expert &&
+        g_stream_selected_cache.slot_count >= (uint64_t)pair_count &&
+        g_stream_selected_cache.gate_offset == gate_offset &&
+        g_stream_selected_cache.up_offset == up_offset &&
+        g_stream_selected_cache.down_offset == down_offset &&
+        g_stream_selected_cache.gate_expert_bytes == gate_expert_bytes &&
+        g_stream_selected_cache.down_expert_bytes == down_expert_bytes &&
+        g_stream_selected_cache.gate_ptr &&
+        g_stream_selected_cache.up_ptr &&
+        g_stream_selected_cache.down_ptr &&
+        g_stream_selected_cache.slot_selected_tensor.ptr;
+    if (g_ssd_streaming_mode && !use_staged) return 0;
+    const int32_t *sel_ids = use_staged ?
+        (const int32_t *)g_stream_selected_cache.slot_selected_tensor.ptr :
+        (const int32_t *)selected->ptr;
+    const char *gate_w;
+    const char *up_w;
+    const char *down_w;
+    if (use_staged) {
+        /* Compact cache stores up at the gate stride (see the staging
+         * loop); for GLM IQ2 layers the two strides are equal anyway. */
+        gate_w = g_stream_selected_cache.gate_ptr;
+        up_w = g_stream_selected_cache.up_ptr;
+        down_w = g_stream_selected_cache.down_ptr;
+        if (up_expert_bytes != gate_expert_bytes) return 0;
+    } else {
+        gate_w = cuda_resolve_weight_ptr(model_map, gate_offset,
+                (uint64_t)n_total_expert * gate_expert_bytes, logical_tier,
+                "glm_gemm_gate");
+        up_w = cuda_resolve_weight_ptr(model_map, up_offset,
+                (uint64_t)n_total_expert * up_expert_bytes, logical_tier,
+                "glm_gemm_up");
+        down_w = cuda_resolve_weight_ptr(model_map, down_offset,
+                (uint64_t)n_total_expert * down_expert_bytes, logical_tier,
+                "glm_gemm_down");
+    }
     if (!gate_w || !up_w || !down_w) return 0;
 
     /* Scratch layout, one arena grab. */
@@ -26653,11 +26687,11 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_gemm_tensor(
     if (!cuda_ok(cudaMemsetAsync(counts, 0, counts_b), "glm gemm counts clear"))
         return 0;
     moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
-            counts, (const int32_t *)selected->ptr, pair_count, n_total_expert);
+            counts, sel_ids, pair_count, n_total_expert);
     moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts,
                                              n_total_expert);
     moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
-            sorted, cursors, (const int32_t *)selected->ptr, pair_count,
+            sorted, cursors, sel_ids, pair_count,
             n_total_expert);
     if (!cuda_ok(cudaGetLastError(), "glm gemm grouping launch")) return 0;
 
@@ -26672,18 +26706,34 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_gemm_tensor(
         free(h_offsets);
         return 0;
     }
-    if (h_offsets[n_total_expert] != pair_count) {
+    const uint32_t valid_pairs = h_offsets[n_total_expert];
+    if (valid_pairs != pair_count &&
+        !(use_staged && cuda_tp_world_is_two())) {
         fprintf(stderr,
                 "ds4: glm moe gemm: %u of %u pairs carry invalid expert ids; "
                 "falling back to the reference kernels\n",
-                pair_count - h_offsets[n_total_expert], pair_count);
+                pair_count - valid_pairs, pair_count);
         free(h_offsets);
         return 0;
     }
-    {
-        const uint64_t n = (uint64_t)pair_count * expert_in_dim;
+    if (valid_pairs != pair_count) {
+        /* 50/50 TP: the missing pairs are peer-owned slots (-1 in the
+         * compact table).  Zero the pair-major scratch so the token sum
+         * reads exact zeros for them - the peer's partial arrives over
+         * the FFN big gate.  Never skip: a token whose experts are all
+         * peer-owned must still contribute a zero partial. */
+        if (!cuda_ok(cudaMemsetAsync(down->ptr, 0,
+                                     (size_t)pair_count * out_dim *
+                                     sizeof(float)),
+                     "glm gemm tp scratch clear")) {
+            free(h_offsets);
+            return 0;
+        }
+    }
+    if (valid_pairs != 0) {
+        const uint64_t n = (uint64_t)valid_pairs * expert_in_dim;
         glm_moe_gemm_gather_x_f16_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
-                xg, (const float *)x->ptr, sorted, pair_count, expert_in_dim,
+                xg, (const float *)x->ptr, sorted, valid_pairs, expert_in_dim,
                 n_expert);
         if (!cuda_ok(cudaGetLastError(), "glm gemm gather launch")) {
             free(h_offsets);
@@ -26763,9 +26813,11 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_gemm_tensor(
     free(h_offsets);
     if (!ok) return 0;
     {
-        const uint64_t n = (uint64_t)pair_count * out_dim;
-        glm_moe_gemm_scatter_down_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
-                (float *)down->ptr, down_g, sorted, pair_count, out_dim);
+        if (valid_pairs != 0) {
+            const uint64_t n = (uint64_t)valid_pairs * out_dim;
+            glm_moe_gemm_scatter_down_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
+                    (float *)down->ptr, down_g, sorted, valid_pairs, out_dim);
+        }
         const uint64_t on = (uint64_t)n_tokens * out_dim;
         moe_sum_kernel<<<(unsigned)((on + 255u) / 256u), 256>>>(
                 (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert,

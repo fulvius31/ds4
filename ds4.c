@@ -39643,8 +39643,11 @@ static bool glm_graph_tp_batch_bounce_ready(ds4_glm_gpu_graph *g,
     if (!g->tp_bounce_out || ds4_gpu_tensor_bytes(g->tp_bounce_out) < bytes) {
         ds4_gpu_tensor_free(g->tp_bounce_out);
         ds4_gpu_tensor_free(g->tp_bounce_in);
-        g->tp_bounce_out = ds4_gpu_tensor_alloc(bytes);
-        g->tp_bounce_in = ds4_gpu_tensor_alloc(bytes);
+        /* Big-gate bounce payloads are read and written by the TP
+         * transport CPU-side: they must be host-visible (Metal buffers
+         * already are; CUDA maps pinned host memory). */
+        g->tp_bounce_out = ds4_gpu_tensor_alloc_shared(bytes);
+        g->tp_bounce_in = ds4_gpu_tensor_alloc_shared(bytes);
     }
     return g->tp_bounce_out && g->tp_bounce_in;
 }
@@ -39705,8 +39708,12 @@ static int glm_graph_routed_moe_batch_dispatch(
             return 0;
         }
         /* Large chunks: dequant + per-expert GEMM runs on tensor cores and
-         * is ~10x the per-pair dot kernels; fall through on any failure. */
-        if (n_tokens >= (getenv("DS4_GLM_MOE_GEMM_MIN") != NULL ?
+         * is ~10x the per-pair dot kernels; fall through on any failure.
+         * Under TP every batch size goes through the GEMM: it is the
+         * owned-partial-aware batch path (the per-pair fallback would
+         * double-count the split experts and is refused downstream). */
+        if (n_tokens >= (g->tp_world == 2 ? 1u :
+                         getenv("DS4_GLM_MOE_GEMM_MIN") != NULL ?
                          (uint32_t)atoi(getenv("DS4_GLM_MOE_GEMM_MIN")) : 128u) &&
             l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS &&
             getenv("DS4_GLM_NO_MOE_GEMM") == NULL &&
@@ -41541,6 +41548,12 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
                 (uint32_t)g->ffn_mid_elems,
                 false,
                 !use_grouped_moe) != 0;
+    }
+    if (ok && tp_batch_split_ffn2) {
+        ok = glm_graph_tp_batch_ffn_combine(g, il, g->batch_ffn_out, n_tokens);
+        if (!ok) fprintf(stderr,
+                         "ds4: GLM TP indexed batch gate failed (layer %u)\n",
+                         il);
     }
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
                                                   stage_sync,
