@@ -40434,7 +40434,24 @@ static int glm_graph_routed_moe_batch_dispatch(
          * is ~10x the per-pair dot kernels; fall through on any failure.
          * Under TP every batch size goes through the GEMM: it is the
          * owned-partial-aware batch path (the per-pair fallback would
-         * double-count the split experts and is refused downstream). */
+         * double-count the split experts and is refused downstream).
+         *
+         * EXPERIMENTAL under TP: the big-gate transports are only
+         * validated for payloads within one bulk window (~2 MB); the
+         * multi-window regime (real prefill chunks) corrupts over RDMA
+         * and stalls over TCP.  Until that is fixed, large-batch TP
+         * prefill requires the explicit opt-in below - without it the
+         * dispatch refuses LOUDLY (prompts small enough for the token
+         * prefill path are unaffected and remain exact). */
+        if (g->tp_world == 2 && n_tokens > 64u &&
+            getenv("DS4_GLM_TP_BATCH_PREFILL_EXPERIMENTAL") == NULL) {
+            fprintf(stderr,
+                    "ds4: GLM TP batch prefill refused: big-gate transport "
+                    "is unvalidated at this payload size (corrupts on rdma, "
+                    "stalls on tcp); set "
+                    "DS4_GLM_TP_BATCH_PREFILL_EXPERIMENTAL=1 to bypass\n");
+            return 0;
+        }
         if (n_tokens >= (g->tp_world == 2 ? 1u :
                          getenv("DS4_GLM_MOE_GEMM_MIN") != NULL ?
                          (uint32_t)atoi(getenv("DS4_GLM_MOE_GEMM_MIN")) : 128u) &&
