@@ -29481,6 +29481,17 @@ __global__ static void glm_iq2xxs_dequant_rows_f16_kernel(
         uint64_t row_bytes,
         uint32_t n_rows,
         uint32_t row_elems) {
+    /* Stage the IQ2 codebook in shared memory: the per-group lookups
+     * below are data-dependent, and divergent __constant__ reads
+     * serialize (the same pathology the decode LUT kernels fixed for a
+     * 1.8x win). */
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x)
+        s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x)
+        s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
     const uint32_t groups_per_row = row_elems >> 3u;
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= (uint64_t)n_rows * groups_per_row) return;
@@ -29496,8 +29507,8 @@ __global__ static void glm_iq2xxs_dequant_rows_f16_kernel(
     const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
     const float d = 0.125f * dev_f16_to_f32(b->d) *
                     (float)(2u * (aux1 >> 28) + 1u);
-    const uint64_t grid = cuda_iq2xxs_grid[(aux0 >> (8u * g8)) & 0xffu];
-    const uint8_t signs = cuda_ksigns_iq2xs[(aux1 >> (7u * g8)) & 127u];
+    const uint64_t grid = s_iq2_grid[(aux0 >> (8u * g8)) & 0xffu];
+    const uint8_t signs = s_iq2_signs[(aux1 >> (7u * g8)) & 127u];
     __half *o = out + (uint64_t)row * row_elems +
                 (uint64_t)blk * 256u + sub * 32u + g8 * 8u;
 #pragma unroll
@@ -29663,7 +29674,9 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_gemm_tensor(
     DS4_GLM_GEMM_SLOT(o_up, gu_b);
     DS4_GLM_GEMM_SLOT(o_mid, mid_b);
     DS4_GLM_GEMM_SLOT(o_downg, downg_b);
-    DS4_GLM_GEMM_SLOT(o_wexp, wexp_b);
+    /* Four dequant arenas: the per-expert chains round-robin across four
+     * streams, so up to four experts' weights are alive at once. */
+    DS4_GLM_GEMM_SLOT(o_wexp, wexp_b * 4u);
 #undef DS4_GLM_GEMM_SLOT
     char *arena = (char *)cuda_tmp_alloc_on(logical_tier, off, "glm moe gemm");
     if (!arena) return 0;
@@ -29677,9 +29690,6 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_gemm_tensor(
     __half   *mid_h   = (__half *)(arena + o_mid);
     float    *down_g  = (float *)(arena + o_downg);
     __half   *wexp    = (__half *)(arena + o_wexp);
-    __half   *wexp_gate = wexp;
-    __half   *wexp_up   = wexp + (uint64_t)expert_mid_dim * expert_in_dim;
-    __half   *wexp_down = wexp_up + (uint64_t)expert_mid_dim * expert_in_dim;
 
     if (!cuda_ok(cudaMemsetAsync(counts, 0, counts_b), "glm gemm counts clear"))
         return 0;
@@ -29744,21 +29754,58 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_gemm_tensor(
     int ok = 1;
     const uint64_t wg_elems = (uint64_t)expert_mid_dim * expert_in_dim;
     const uint64_t wd_elems = (uint64_t)out_dim * expert_mid_dim;
+    /* Four-way stream round-robin: the profile shows this loop is
+     * launch/serialization-bound (471 ms/layer at 2048 tokens; small
+     * chunks are 1.6x worse per token), so overlap four experts'
+     * dequant+GEMM chains.  Each stream owns one dequant arena; the
+     * per-pair output regions are disjoint by construction. */
+    static cudaStream_t gemm_streams[4];
+    static cudaEvent_t gemm_fence;
+    const int use_streams =
+        getenv("DS4_GLM_NO_GEMM_STREAMS") == NULL &&
+        (gemm_streams[3] != NULL ||
+         (cudaStreamCreateWithFlags(&gemm_streams[0], cudaStreamNonBlocking) == cudaSuccess &&
+          cudaStreamCreateWithFlags(&gemm_streams[1], cudaStreamNonBlocking) == cudaSuccess &&
+          cudaStreamCreateWithFlags(&gemm_streams[2], cudaStreamNonBlocking) == cudaSuccess &&
+          cudaStreamCreateWithFlags(&gemm_streams[3], cudaStreamNonBlocking) == cudaSuccess &&
+          cudaEventCreateWithFlags(&gemm_fence, cudaEventDisableTiming) == cudaSuccess));
+    if (use_streams) {
+        /* The gather ran on the legacy stream; fence the workers. */
+        ok = cudaEventRecord(gemm_fence, 0) == cudaSuccess;
+        for (int s = 0; ok && s < 4; s++)
+            ok = cudaStreamWaitEvent(gemm_streams[s], gemm_fence, 0) ==
+                 cudaSuccess;
+        if (!ok) {
+            free(h_offsets);
+            return 0;
+        }
+    }
+    uint32_t round_robin = 0;
     for (uint32_t e = 0; ok && e < n_total_expert; e++) {
         const uint32_t cnt = h_offsets[e + 1] - h_offsets[e];
         if (cnt == 0) continue;
         const uint32_t base = h_offsets[e];
+        const uint32_t si = round_robin++ & 3u;
+        cudaStream_t est = use_streams ? gemm_streams[si] : (cudaStream_t)0;
+        __half *wexp_gate = wexp + (uint64_t)si *
+                (wg_elems * 2u + wd_elems);
+        __half *wexp_up = wexp_gate + wg_elems;
+        __half *wexp_down = wexp_up + wg_elems;
+        if (cublasSetStream(handle, est) != CUBLAS_STATUS_SUCCESS) {
+            ok = 0;
+            break;
+        }
         /* Dequant this expert's gate/up/down to f16. */
         {
             const uint64_t n = wg_elems >> 3u;
-            glm_iq2xxs_dequant_rows_f16_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
+            glm_iq2xxs_dequant_rows_f16_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, est>>>(
                     wexp_gate, gate_w + (uint64_t)e * gate_expert_bytes,
                     gate_row_bytes, expert_mid_dim, expert_in_dim);
-            glm_iq2xxs_dequant_rows_f16_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
+            glm_iq2xxs_dequant_rows_f16_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, est>>>(
                     wexp_up, up_w + (uint64_t)e * up_expert_bytes,
                     up_row_bytes, expert_mid_dim, expert_in_dim);
             const uint64_t nd = wd_elems >> 3u;
-            glm_iq2xxs_dequant_rows_f16_kernel<<<(unsigned)((nd + 255u) / 256u), 256>>>(
+            glm_iq2xxs_dequant_rows_f16_kernel<<<(unsigned)((nd + 255u) / 256u), 256, 0, est>>>(
                     wexp_down, down_w + (uint64_t)e * down_expert_bytes,
                     down_row_bytes, out_dim, expert_mid_dim);
         }
@@ -29787,7 +29834,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_gemm_tensor(
         }
         if (st == CUBLAS_STATUS_SUCCESS) {
             const uint64_t n = (uint64_t)cnt * expert_mid_dim;
-            glm_moe_gemm_silu_mul_w_f16_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
+            glm_moe_gemm_silu_mul_w_f16_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, est>>>(
                     mid_h + (uint64_t)base * expert_mid_dim,
                     gate_g + (uint64_t)base * expert_mid_dim,
                     up_g + (uint64_t)base * expert_mid_dim,
@@ -29808,6 +29855,12 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_gemm_tensor(
         ok = cublas_ok(st, "glm moe gemm");
     }
     free(h_offsets);
+    if (use_streams) {
+        (void)cublasSetStream(handle, (cudaStream_t)0);
+        for (int s = 0; s < 4; s++) {
+            if (cudaStreamSynchronize(gemm_streams[s]) != cudaSuccess) ok = 0;
+        }
+    }
     if (!ok) return 0;
     {
         if (valid_pairs != 0) {
