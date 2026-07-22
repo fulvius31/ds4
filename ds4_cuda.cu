@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -326,6 +327,36 @@ static int cuda_expert_pool_acquire(uint32_t key, uint32_t *slot_out,
     g_expert_pool.key_to_slot[key] = slot;
     *slot_out = slot;
     return 1;
+}
+
+/* QD8 readahead: the NVMe serves 4.9 GB/s at queue depth 1 and
+ * 11.2 GB/s at QD8, and the expert staging loop is a chain of
+ * synchronous reads.  Rather than re-plumbing the copies (a worker-pool
+ * variant measured SLOWER on warm page cache - it added a CPU staging
+ * hop the GB10 coherent path never needed), hint every miss range with
+ * madvise(MADV_WILLNEED) before the loop: the kernel prefetches cold
+ * pages at device queue depth in the background while the unchanged
+ * copies consume them, and warm caches see a no-op. */
+typedef struct {
+    uint64_t src_off;
+    uint64_t bytes;
+} cuda_fetch_job;
+
+static void cuda_fetch_readahead(const void *model_map, uint64_t model_size,
+                                 const cuda_fetch_job *jobs, uint32_t n) {
+    if (!model_map || n == 0 || getenv("DS4_CUDA_NO_FETCH_READAHEAD"))
+        return;
+    const long page_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page = page_l > 0 ? (uint64_t)page_l : 4096u;
+    for (uint32_t i = 0; i < n; i++) {
+        if (jobs[i].src_off > model_size ||
+            jobs[i].bytes > model_size - jobs[i].src_off)
+            continue;
+        const uintptr_t a = (uintptr_t)model_map + jobs[i].src_off;
+        const uintptr_t a0 = a & ~(uintptr_t)(page - 1u);
+        (void)madvise((void *)a0, (size_t)(a - a0 + jobs[i].bytes),
+                      MADV_WILLNEED);
+    }
 }
 
 static void cuda_stream_selected_cache_invalidate(void) {
@@ -26471,6 +26502,38 @@ static int cuda_stream_selected_cache_begin_load(
                                                 table->layer,
                                                 table->gate_expert_bytes,
                                                 table->down_expert_bytes);
+    /* Pass 1: acquire pool slots and hint every miss's ranges to the
+     * kernel readahead, so the synchronous copies in pass 2 consume
+     * pages that are already streaming in at device queue depth.
+     * Slots claimed here are marked used, so later acquisitions in the
+     * same pass cannot evict them. */
+    std::vector<uint32_t> pool_slot(compact_ids.size(), UINT32_MAX);
+    std::vector<uint8_t> pool_hit(compact_ids.size(), 0);
+    std::vector<cuda_fetch_job> fetch_jobs;
+    if (pool_ok) {
+        for (uint32_t i = 0; i < compact_ids.size(); i++) {
+            const uint32_t expert = (uint32_t)compact_ids[i];
+            uint32_t slot = 0;
+            int hit = 0;
+            if (!cuda_expert_pool_acquire(table->layer * 256u + expert,
+                                          &slot, &hit))
+                break;
+            pool_slot[i] = slot;
+            pool_hit[i] = hit ? 1u : 0u;
+            if (hit) continue;
+            fetch_jobs.push_back({table->gate_offset +
+                                  (uint64_t)expert * table->gate_expert_bytes,
+                                  table->gate_expert_bytes});
+            fetch_jobs.push_back({table->up_offset +
+                                  (uint64_t)expert * table->gate_expert_bytes,
+                                  table->gate_expert_bytes});
+            fetch_jobs.push_back({table->down_offset +
+                                  (uint64_t)expert * table->down_expert_bytes,
+                                  table->down_expert_bytes});
+        }
+        cuda_fetch_readahead(table->model_map, table->model_size,
+                             fetch_jobs.data(), (uint32_t)fetch_jobs.size());
+    }
     for (uint32_t i = 0; i < compact_ids.size(); i++) {
         const uint64_t expert = (uint32_t)compact_ids[i];
         const uint64_t gate_src =
@@ -26481,11 +26544,14 @@ static int cuda_stream_selected_cache_begin_load(
             table->down_offset + expert * table->down_expert_bytes;
         const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
         const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
-        uint32_t slot = 0;
-        int hit = 0;
-        if (pool_ok &&
+        uint32_t slot = pool_slot[i];
+        int hit = slot != UINT32_MAX ? (int)pool_hit[i] : 0;
+        if (pool_ok && slot == UINT32_MAX &&
             cuda_expert_pool_acquire(table->layer * 256u + (uint32_t)expert,
                                      &slot, &hit)) {
+            /* acquired late (pass-1 break); fall through to fill below */
+        }
+        if (pool_ok && slot != UINT32_MAX) {
             char *pg = cuda_expert_pool_ptr(g_expert_pool.gate_chunks, slot,
                                             g_expert_pool.gate_bytes);
             char *pu = cuda_expert_pool_ptr(g_expert_pool.up_chunks, slot,
