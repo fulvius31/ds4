@@ -1021,6 +1021,111 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     return ok;
 }
 
+/* RC direct bulk: reliable-connected QPs carry gigabyte messages, so
+ * off-Apple the big gate is one pre-posted recv + one send between the
+ * registered bounce buffers - no multi-window staging (the chunked
+ * Thunderbolt path corrupts beyond one window and stays Apple-only).
+ * The TCP header handshake in the caller doubles as the barrier that
+ * guarantees both sides posted their recv before either sends. */
+#ifndef __APPLE__
+#define DS4_TP_RDMA_RC_BULK 1
+#endif
+
+#ifdef DS4_TP_RDMA_RC_BULK
+enum { DS4_TP_RC_MR_CACHE = 4 };
+typedef struct {
+    const void *addr;
+    uint64_t bytes;
+    struct ibv_mr *mr;
+} tp_rc_mr_entry;
+static tp_rc_mr_entry g_rc_mrs[DS4_TP_RC_MR_CACHE];
+
+static struct ibv_mr *tp_rc_mr(ds4_tp *tp, void *addr, uint64_t bytes) {
+    for (int i = 0; i < DS4_TP_RC_MR_CACHE; i++) {
+        if (g_rc_mrs[i].addr == addr && g_rc_mrs[i].bytes >= bytes)
+            return g_rc_mrs[i].mr;
+    }
+    struct ibv_mr *mr = tp->rdma.api.reg_mr(tp->rdma.pd, addr, bytes,
+                                            IBV_ACCESS_LOCAL_WRITE);
+    if (!mr) return NULL;
+    for (int i = 0; i < DS4_TP_RC_MR_CACHE; i++) {
+        if (!g_rc_mrs[i].mr) {
+            g_rc_mrs[i].addr = addr;
+            g_rc_mrs[i].bytes = bytes;
+            g_rc_mrs[i].mr = mr;
+            return mr;
+        }
+    }
+    /* cache full: evict slot 0 */
+    (void)tp->rdma.api.dereg_mr(g_rc_mrs[0].mr);
+    g_rc_mrs[0].addr = addr;
+    g_rc_mrs[0].bytes = bytes;
+    g_rc_mrs[0].mr = mr;
+    return mr;
+}
+
+#define DS4_TP_RC_BULK_SEND_TAG (UINT64_C(1) << 62)
+#define DS4_TP_RC_BULK_RECV_TAG (UINT64_C(1) << 61)
+
+/* Post the recv side of an RC bulk gate.  Must run BEFORE the header
+ * handshake so the peer's send always finds it. */
+static int tp_rdma_rc_bulk_post_recv(ds4_tp *tp, void *in, uint64_t bytes) {
+    struct ibv_mr *imr = tp_rc_mr(tp, in, bytes);
+    if (!imr) return 0;
+    struct ibv_sge sge = { (uintptr_t)in, (uint32_t)bytes, imr->lkey };
+    struct ibv_recv_wr wr, *bad = NULL;
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id = DS4_TP_RC_BULK_RECV_TAG;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    return ibv_post_recv(tp->rdma.qp, &wr, &bad) == 0;
+}
+
+static int tp_rdma_rc_bulk_finish(ds4_tp *tp, const void *out,
+                                  uint64_t bytes) {
+    struct ibv_mr *omr = tp_rc_mr(tp, (void *)(uintptr_t)out, bytes);
+    if (!omr) return 0;
+    struct ibv_sge sge = { (uintptr_t)out, (uint32_t)bytes, omr->lkey };
+    struct ibv_send_wr wr, *bad = NULL;
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id = DS4_TP_RC_BULK_SEND_TAG;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    if (ibv_post_send(tp->rdma.qp, &wr, &bad) != 0) return 0;
+    int need_send = 1, need_recv = 1;
+    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    while (need_send || need_recv) {
+        struct ibv_wc wc[4];
+        int n = ibv_poll_cq(tp->rdma.cq, 4, wc);
+        if (n < 0) return 0;
+        for (int i = 0; i < n; i++) {
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                fprintf(stderr, "ds4-tp: rc bulk completion error %d (wr %llx)\n",
+                        (int)wc[i].status,
+                        (unsigned long long)wc[i].wr_id);
+                return 0;
+            }
+            if (wc[i].wr_id == DS4_TP_RC_BULK_SEND_TAG) need_send = 0;
+            else if (wc[i].wr_id == DS4_TP_RC_BULK_RECV_TAG) need_recv = 0;
+            else if (wc[i].opcode & IBV_WC_RECV) {
+                /* stray decode-window recv: account it */
+                if (wc[i].wr_id > tp->rdma.recv_done)
+                    tp->rdma.recv_done = wc[i].wr_id;
+            } else if (tp->rdma.send_outstanding > 0) {
+                tp->rdma.send_outstanding--;
+            }
+        }
+        if (tp_now_sec() > deadline) {
+            fprintf(stderr, "ds4-tp: rc bulk timeout\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+#endif /* DS4_TP_RDMA_RC_BULK */
+
 static int tp_rdma_big_gate_capable(const ds4_tp *tp) {
     const uint64_t stage_bytes =
         (uint64_t)DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG;
@@ -1597,6 +1702,17 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
+#if defined(DS4_TP_HAVE_VERBS) && defined(DS4_TP_RDMA_RC_BULK)
+    int rc_bulk = 0;
+    if (tp->rdma_active && getenv("DS4_TP_NO_RC_BULK") == NULL) {
+        /* Drain the decode recv window and post the bulk recv BEFORE the
+         * header barrier, so the peer's send always lands in it. */
+        if (!tp_rdma_drain_decode_window(tp)) return 0;
+        rc_bulk = tp_rdma_rc_bulk_post_recv(tp, in, bytes);
+        if (!rc_bulk)
+            fprintf(stderr, "ds4-tp: rc bulk recv post failed; tcp fallback\n");
+    }
+#endif
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     ds4_tp_gate_header ph;
     if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
@@ -1608,6 +1724,9 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                 layer, (unsigned long long)seq);
         return 0;
     }
+#if defined(DS4_TP_HAVE_VERBS) && defined(DS4_TP_RDMA_RC_BULK)
+    if (rc_bulk) return tp_rdma_rc_bulk_finish(tp, out, bytes);
+#endif
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
         if (!tp_rdma_drain_decode_window(tp)) return 0;
