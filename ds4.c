@@ -42042,7 +42042,11 @@ static bool glm_graph_cuda_stream_prefill_batch_selected_load(
         uint64_t                 gate_expert_bytes,
         uint64_t                 down_expert_bytes) {
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
-    if (!g || !model || !l || n_tokens <= 1 ||
+    /* n_tokens == 1 is real on the pipeline slice path: forward_token
+     * decodes through the batch encoders, so the batch staging must run
+     * there too (skipping it leaves the previous prefill layer's cache
+     * in place and the routed dispatch refuses the layer). */
+    if (!g || !model || !l || n_tokens == 0 ||
         !g->ssd_streaming ||
         !g->batch_router_selected ||
         !glm_graph_layer_uses_generic_routed_moe(l) ||

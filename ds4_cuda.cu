@@ -24140,8 +24140,26 @@ static int routed_moe_launch(
     if (g_ssd_streaming_mode && allow_streaming &&
         !use_stream_selected_cache) {
         fprintf(stderr,
-                "ds4: CUDA streaming selected experts are unavailable for layer %u\n",
-                layer_index);
+                "ds4: CUDA streaming selected experts are unavailable for layer %u "
+                "(valid=%d tier=%d/%d map=%d layer=%u total=%u/%u slots=%u/%llu "
+                "goff=%d uoff=%d doff=%d gbytes=%d dbytes=%d ptrs=%d%d%d%d)\n",
+                layer_index,
+                g_stream_selected_cache.valid,
+                g_stream_selected_cache.logical_tier, logical_tier,
+                g_stream_selected_cache.model_map == model_map,
+                g_stream_selected_cache.layer,
+                g_stream_selected_cache.n_total_expert, n_total_expert,
+                g_stream_selected_cache.slot_count,
+                (unsigned long long)required_slot_count,
+                g_stream_selected_cache.gate_offset == gate_offset,
+                g_stream_selected_cache.up_offset == up_offset,
+                g_stream_selected_cache.down_offset == down_offset,
+                g_stream_selected_cache.gate_expert_bytes == gate_expert_bytes,
+                g_stream_selected_cache.down_expert_bytes == down_expert_bytes,
+                g_stream_selected_cache.gate_ptr != NULL,
+                g_stream_selected_cache.up_ptr != NULL,
+                g_stream_selected_cache.down_ptr != NULL,
+                g_stream_selected_cache.slot_selected_tensor.ptr != NULL);
         return 0;
     }
     if (use_stream_selected_cache) {
