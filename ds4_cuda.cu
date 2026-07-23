@@ -28582,7 +28582,6 @@ enum {
 static int32_t g_tp_split_rank;
 static int32_t g_tp_split_world = 1;
 static int g_tp_session_batch_mode;
-static int g_tp_attn_head_split;
 static int g_tp_flag_gates;
 static int g_tp_memops_64;
 static volatile uint32_t *g_tp_gpu_flags;    /* CPU view of slab flag words */
@@ -28649,21 +28648,12 @@ static void cuda_tp_expert_range(uint32_t n_total_expert,
     }
 }
 
-static void DS4_CUDA_UNUSED cuda_tp_attn_head_range(uint32_t n_head,
-                                                    uint32_t group,
-                                                    uint32_t *head_base,
-                                                    uint32_t *head_count) {
-    *head_base = 0;
-    *head_count = n_head;
-    if (!g_tp_attn_head_split || g_tp_split_world != 2) return;
-    const uint32_t half = n_head / 2u;
-    if (half == 0u || (half % group) != 0u || (n_head % 2u) != 0u) return;
-    *head_count = half;
-    *head_base = g_tp_split_rank == 1 ? half : 0u;
-}
-
 extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled) {
-    g_tp_attn_head_split = enabled ? 1 : 0;
+    /* CUDA splits attention heads through the k-slice output-projection path
+     * gated by DS4_GLM_TP_ATTN_SPLIT in ds4.c, not this cross-backend flag
+     * (which is live only on Metal/ROCm). Kept as a no-op to satisfy the
+     * shared ds4_gpu API and the ds4.c call sites. */
+    (void)enabled;
 }
 
 /* True when a pointer is CPU-dereferenceable (pinned host or managed):
