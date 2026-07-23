@@ -21306,16 +21306,29 @@ static void metal_graph_selected_async_load_run(
             return;
         }
 #else
-        if (ds4_gpu_wait_selected_readback_ready(job->event_value,
-                                                 "selected-id async expert load") == 0) {
-            return;
-        }
-        if (ds4_gpu_tensor_read(job->router_selected,
-                                0,
-                                job->selected_ids,
-                                (uint64_t)DS4_N_EXPERT_USED *
-                                    sizeof(job->selected_ids[0])) == 0) {
-            return;
+        if (ds4_gpu_selected_readback_event_supported()) {
+            if (ds4_gpu_tensor_read_after_selected_event(
+                        job->router_selected,
+                        0,
+                        job->selected_ids,
+                        (uint64_t)DS4_N_EXPERT_USED *
+                            sizeof(job->selected_ids[0]),
+                        job->event_value,
+                        "selected-id async expert load") == 0) {
+                return;
+            }
+        } else {
+            if (ds4_gpu_wait_selected_readback_ready(job->event_value,
+                                                     "selected-id async expert load") == 0) {
+                return;
+            }
+            if (ds4_gpu_tensor_read(job->router_selected,
+                                    0,
+                                    job->selected_ids,
+                                    (uint64_t)DS4_N_EXPERT_USED *
+                                        sizeof(job->selected_ids[0])) == 0) {
+                return;
+            }
         }
 #endif
     }
@@ -21469,6 +21482,39 @@ static bool metal_graph_selected_async_load_finish(
     if (!job->ok) return false;
     return ds4_gpu_routed_moe_set_selected_override(job->selected_ids,
                                                    DS4_N_EXPERT_USED) != 0;
+}
+
+/* Settle a decode selected-expert async load: wait for the worker, retry
+ * the staging synchronously when the worker could not stage it (it must
+ * not wait on in-flight cache entries; this thread is allowed to), and
+ * fall back to the fully synchronous load when the ids never arrived. */
+static bool metal_graph_decode_selected_async_settle(
+        metal_graph_selected_async_load *job,
+        ds4_gpu_graph            *g,
+        const ds4_model          *model,
+        const ds4_layer_weights  *layer,
+        uint32_t                  il,
+        uint64_t                  gate_expert_bytes,
+        uint64_t                  down_expert_bytes) {
+    if (metal_graph_selected_async_load_finish(job)) return true;
+    if (job->ids_ok) {
+        const ds4_gpu_stream_expert_table retry_table =
+            graph_stream_expert_table_make(model,
+                                           layer,
+                                           il,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
+        return ds4_gpu_stream_expert_cache_begin_selected_load(
+                       &retry_table,
+                       job->selected_ids,
+                       DS4_N_EXPERT_USED) != 0 &&
+               ds4_gpu_routed_moe_set_selected_override(
+                       job->selected_ids,
+                       DS4_N_EXPERT_USED) != 0;
+    }
+    return metal_graph_decode_cuda_selected_load(g, model, layer, il,
+                                                 gate_expert_bytes,
+                                                 down_expert_bytes);
 }
 
 #ifdef DS4_ROCM_BUILD
@@ -23732,13 +23778,42 @@ static bool metal_graph_encode_decode_layer_phase(
         metal_graph_decode_cuda_selected_slots_expected(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
         getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL;
+    /* TP (and other non-overlap) streaming decode: hand the selected-id
+     * readback + expert staging to the async worker so it overlaps the
+     * shared-expert encode and the TP gate waits below, instead of
+     * draining the stream and staging inline on this thread. Settled
+     * exactly once before any routed consumer (or return path). */
+    metal_graph_selected_async_load stream_selected_async_load = {0};
+    bool stream_selected_async_started = false;
+    bool stream_selected_async_settled = false;
+    const bool cuda_stream_selected_async =
+        cuda_stream_selected_load &&
+        !decode_stage_profile &&
+        metal_graph_use_iq2_selected_async_load(g);
     if (cuda_stream_selected_load) {
-        ok = metal_graph_decode_cuda_selected_load(g,
-                                                   model,
-                                                   layer,
-                                                   il,
-                                                   gate_expert_bytes,
-                                                   down_expert_bytes);
+        if (cuda_stream_selected_async) {
+            uint64_t stream_selected_event = 0;
+            if (ds4_gpu_signal_selected_readback_ready(&stream_selected_event) != 0) {
+                stream_selected_async_started =
+                    metal_graph_selected_async_load_start(
+                            &stream_selected_async_load,
+                            g,
+                            model,
+                            layer,
+                            il,
+                            stream_selected_event,
+                            gate_expert_bytes,
+                            down_expert_bytes);
+            }
+        }
+        if (!stream_selected_async_started) {
+            ok = metal_graph_decode_cuda_selected_load(g,
+                                                       model,
+                                                       layer,
+                                                       il,
+                                                       gate_expert_bytes,
+                                                       down_expert_bytes);
+        }
     }
     if (selected_readahead_shared_delay) {
         if (ok) {
@@ -23802,6 +23877,11 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      NULL,
                                                      il,
                                                      false) != 0;
+        if (!ok && getenv("DS4_GLM_TP_DEBUG")) {
+            fprintf(stderr,
+                    "ds4: glm decode routed_moe dispatch failed layer=%u pos=%u\n",
+                    il, pos);
+        }
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_routed_gate(g),
@@ -23881,7 +23961,11 @@ static bool metal_graph_encode_decode_layer_phase(
         bool async_load_started = false;
         const bool async_early_commit =
             async_selected_load &&
-            metal_graph_use_iq2_selected_async_early_commit(g);
+            metal_graph_use_iq2_selected_async_early_commit(g) &&
+            /* CUDA submits eagerly and its flush is a full device drain on
+             * the encode thread; the Metal-style early commit is pure loss
+             * once native readback events exist. */
+            !ds4_gpu_selected_readback_event_supported();
         if (ok && async_selected_load) {
             ok = metal_graph_selected_async_load_start(&async_load,
                                                        g,
@@ -23964,6 +24048,11 @@ static bool metal_graph_encode_decode_layer_phase(
         } else if (ok) {
             ok = ds4_gpu_commit_and_wait_selected_readback(selected_event,
                                                            "selected-id shared-overlap") != 0;
+            if (!ok && getenv("DS4_GLM_TP_DEBUG")) {
+                fprintf(stderr,
+                        "ds4: glm decode selected readback wait failed layer=%u pos=%u\n",
+                        il, pos);
+            }
         }
         if (ok && !async_load_started) {
             int32_t selected_ids[DS4_MAX_EXPERT_USED];
@@ -23973,6 +24062,24 @@ static bool metal_graph_encode_decode_layer_phase(
                                      (uint64_t)DS4_N_EXPERT_USED * sizeof(selected_ids[0])) != 0 &&
                  ds4_gpu_routed_moe_set_selected_override(selected_ids,
                                                           DS4_N_EXPERT_USED) != 0;
+            if (!ok && getenv("DS4_GLM_TP_DEBUG")) {
+                fprintf(stderr,
+                        "ds4: glm decode selected-id read failed layer=%u pos=%u\n",
+                        il, pos);
+            }
+            if (ok && getenv("DS4_GLM_TP_DEBUG")) {
+                char idbuf[192];
+                int idoff = 0;
+                for (uint32_t k = 0;
+                     k < DS4_N_EXPERT_USED && idoff < (int)sizeof(idbuf) - 12;
+                     k++) {
+                    idoff += snprintf(idbuf + idoff, sizeof(idbuf) - idoff,
+                                      " %d", selected_ids[k]);
+                }
+                fprintf(stderr,
+                        "ds4: glm decode selected ids layer=%u pos=%u:%s\n",
+                        il, pos, idbuf);
+            }
             if (ok) {
                 const ds4_gpu_stream_expert_table table =
                     graph_stream_expert_table_make(model,
@@ -23984,6 +24091,11 @@ static bool metal_graph_encode_decode_layer_phase(
                             &table,
                             selected_ids,
                             DS4_N_EXPERT_USED) != 0;
+                if (!ok && getenv("DS4_GLM_TP_DEBUG")) {
+                    fprintf(stderr,
+                            "ds4: glm decode selected begin_load failed layer=%u pos=%u\n",
+                            il, pos);
+                }
             }
         }
         if (ok) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
@@ -24008,6 +24120,11 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      NULL,
                                                      il,
                                                      false) != 0;
+        if (!ok && getenv("DS4_GLM_TP_DEBUG")) {
+            fprintf(stderr,
+                    "ds4: glm decode routed_moe dispatch failed layer=%u pos=%u\n",
+                    il, pos);
+        }
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_routed_gate(g),
@@ -24078,6 +24195,16 @@ static bool metal_graph_encode_decode_layer_phase(
     const bool tp_fold_ffn = tp_split_shared &&
                              !keep_ffn_out &&
                              !metal_graph_directional_steering_ffn_enabled(g);
+    if (stream_selected_async_started && !stream_selected_async_settled &&
+        !tp_fold_ffn) {
+        const bool stream_selected_settled =
+            metal_graph_decode_selected_async_settle(
+                    &stream_selected_async_load,
+                    g, model, layer, il,
+                    gate_expert_bytes, down_expert_bytes);
+        stream_selected_async_settled = true;
+        ok = ok && stream_selected_settled;
+    }
     if (ok && !tp_fold_ffn && !cuda_tp_moe) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
                                                  metal_graph_routed_gate(g),
                                                  metal_graph_routed_up(g),
@@ -24120,6 +24247,15 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     if (phase == METAL_DECODE_LAYER_TO_SHARED_MID ||
         phase == METAL_DECODE_LAYER_FROM_QA_KV_RAW_TO_SHARED_MID) {
+        if (stream_selected_async_started && !stream_selected_async_settled) {
+            const bool stream_selected_settled =
+                metal_graph_decode_selected_async_settle(
+                        &stream_selected_async_load,
+                        g, model, layer, il,
+                        gate_expert_bytes, down_expert_bytes);
+            stream_selected_async_settled = true;
+            ok = ok && stream_selected_settled;
+        }
         return ok;
     }
     if (ok && tp_split_shared) {
@@ -24332,6 +24468,16 @@ static bool metal_graph_encode_decode_layer_phase(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp", metal_graph_shared_out(g), DS4_N_EMBD, il, pos);
     }
+    if (stream_selected_async_started && !stream_selected_async_settled &&
+        tp_fold_ffn) {
+        const bool stream_selected_settled =
+            metal_graph_decode_selected_async_settle(
+                    &stream_selected_async_load,
+                    g, model, layer, il,
+                    gate_expert_bytes, down_expert_bytes);
+        stream_selected_async_settled = true;
+        ok = ok && stream_selected_settled;
+    }
     if (ok && tp_fold_ffn) {
         ok = ds4_gpu_routed_moe_one_tensor(
                 g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN],
@@ -24416,6 +24562,17 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
 #undef DS4_METAL_PROFILE_DECODE_STAGE
+    /* Safety net: no flow may leave an async selected load pending — a
+     * leaked job would poison every later layer's start. */
+    if (stream_selected_async_started && !stream_selected_async_settled) {
+        const bool stream_selected_settled =
+            metal_graph_decode_selected_async_settle(
+                    &stream_selected_async_load,
+                    g, model, layer, il,
+                    gate_expert_bytes, down_expert_bytes);
+        stream_selected_async_settled = true;
+        ok = ok && stream_selected_settled;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_after_ffn_hc(g), hc_dim, il, pos);
     }
