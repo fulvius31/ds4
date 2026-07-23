@@ -26400,7 +26400,8 @@ static int cuda_stream_selected_ranges_valid(
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
-        uint32_t slot_count) {
+        uint32_t slot_count,
+        int pool_insert) {
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) return 1;
     if (!cuda_stream_selected_ranges_valid(table) || !selected_ids ||
@@ -26498,7 +26499,13 @@ static int cuda_stream_selected_cache_begin_load(
         return 0;
     }
 
-    const int pool_ok = cuda_expert_pool_ensure(table->n_total_expert,
+    /* Batch prefill stays out of the LRU: one chunk selects ~all owned
+     * experts across 76 layers (~9.7k keys vs 6k slots), so inserting
+     * evicts the entire decode working set for zero cross-chunk reuse
+     * (the OS page cache already serves prefill re-reads). Decode keeps
+     * the pool and now survives any ingest with its hot set intact. */
+    const int pool_ok = pool_insert &&
+                        cuda_expert_pool_ensure(table->n_total_expert,
                                                 table->layer,
                                                 table->gate_expert_bytes,
                                                 table->down_expert_bytes);
@@ -26521,6 +26528,24 @@ static int cuda_stream_selected_cache_begin_load(
             pool_slot[i] = slot;
             pool_hit[i] = hit ? 1u : 0u;
             if (hit) continue;
+            fetch_jobs.push_back({table->gate_offset +
+                                  (uint64_t)expert * table->gate_expert_bytes,
+                                  table->gate_expert_bytes});
+            fetch_jobs.push_back({table->up_offset +
+                                  (uint64_t)expert * table->gate_expert_bytes,
+                                  table->gate_expert_bytes});
+            fetch_jobs.push_back({table->down_offset +
+                                  (uint64_t)expert * table->down_expert_bytes,
+                                  table->down_expert_bytes});
+        }
+        cuda_fetch_readahead(table->model_map, table->model_size,
+                             fetch_jobs.data(), (uint32_t)fetch_jobs.size());
+    } else {
+        /* Pool bypassed: the direct path still deserves device-queue-depth
+         * readahead — hint every compact expert's three ranges before the
+         * synchronous copy loop (QD8 ~11.2 GB/s vs QD1 ~4.9 on this NVMe). */
+        for (uint32_t i = 0; i < compact_ids.size(); i++) {
+            const uint32_t expert = (uint32_t)compact_ids[i];
             fetch_jobs.push_back({table->gate_offset +
                                   (uint64_t)expert * table->gate_expert_bytes,
                                   table->gate_expert_bytes});
@@ -30699,7 +30724,7 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                  "GLM streaming selected-id read")) {
         return 0;
     }
-    return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected);
+    return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected, 1);
 }
 
 __global__ static void glm_value_project_q8_0_batch_heads_kernel(
@@ -31240,7 +31265,7 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
     return cuda_stream_selected_cache_begin_load(table, selected_ids,
-                                                 n_selected);
+                                                 n_selected, 1);
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
@@ -31951,8 +31976,13 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         (uint64_t)n_tokens * n_selected > UINT32_MAX) {
         return 0;
     }
+    /* Batch prefill (n_tokens > 1) bypasses LRU insertion so the decode
+     * working set survives ingest; DS4_CUDA_POOL_PREFILL_INSERT restores
+     * the old flooding behavior for A/B runs. */
+    const int pool_insert = n_tokens <= 1 ||
+                            getenv("DS4_CUDA_POOL_PREFILL_INSERT") != NULL;
     return cuda_stream_selected_cache_begin_load(
-            table, selected_ids, n_tokens * n_selected);
+            table, selected_ids, n_tokens * n_selected, pool_insert);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
