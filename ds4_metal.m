@@ -8845,6 +8845,20 @@ int ds4_gpu_tp_failed(void) {
     return g_tp_failed_flag;
 }
 
+int ds4_gpu_selected_readback_event_supported(void) {
+    return 0;
+}
+
+int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
+                                             uint64_t offset,
+                                             void *data,
+                                             uint64_t bytes,
+                                             uint64_t event_value,
+                                             const char *label) {
+    if (ds4_gpu_wait_selected_readback_ready(event_value, label) == 0) return 0;
+    return ds4_gpu_tensor_read(tensor, offset, data, bytes);
+}
+
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (event_value == 0) return 0;

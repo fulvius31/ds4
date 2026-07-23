@@ -23475,6 +23475,14 @@ static int cuda_stream_selected_cache_begin_load(
     if (!g_ssd_streaming_mode) return 1;
     if (!cuda_stream_selected_ranges_valid(table) || !selected_ids ||
         slot_count == 0) {
+        fprintf(stderr,
+                "ds4: CUDA streaming selected begin_load refused: table_valid=%d ids=%d slots=%u layer=%u map=%p size=%llu\n",
+                cuda_stream_selected_ranges_valid(table),
+                selected_ids != NULL,
+                slot_count,
+                table ? table->layer : 0u,
+                table ? table->model_map : NULL,
+                table ? (unsigned long long)table->model_size : 0ull);
         return 0;
     }
     if (g_n_gpus != 1) {
@@ -23492,6 +23500,9 @@ static int cuda_stream_selected_cache_begin_load(
                             slot_count : table->n_total_expert);
         slot_ids.resize(slot_count);
     } catch (...) {
+        fprintf(stderr,
+                "ds4: CUDA streaming selected begin_load: host table alloc failed (layer=%u)\n",
+                table->layer);
         return 0;
     }
     /* 50/50 tensor parallelism: peer-owned experts are never staged on
@@ -23526,7 +23537,12 @@ static int cuda_stream_selected_cache_begin_load(
         slot_ids[i] = compact;
     }
     if (compact_ids.empty()) {
-        if (!tp_split) return 0;
+        if (!tp_split) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming selected begin_load: no stageable experts (layer=%u)\n",
+                    table->layer);
+            return 0;
+        }
         /* Every selected expert belongs to the peer this token.  Stage
          * one owned expert as a structural placeholder (usually a cache
          * hit): every slot stays -1, so no kernel ever reads it and the
@@ -23564,6 +23580,12 @@ static int cuda_stream_selected_cache_begin_load(
                 &g_stream_selected_cache.down_capacity,
                 down_bytes, "down experts") ||
         !cuda_stream_selected_ensure_i32(slot_count)) {
+        fprintf(stderr,
+                "ds4: CUDA streaming selected cache alloc failed (layer=%u gate=%llu down=%llu slots=%u)\n",
+                table->layer,
+                (unsigned long long)gate_bytes,
+                (unsigned long long)down_bytes,
+                slot_count);
         cuda_stream_selected_cache_invalidate();
         return 0;
     }
@@ -28437,9 +28459,56 @@ extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
             in_dim, out_dim, x, 1, clamp);
 }
 
+/* Selected-readback events: recorded on the encode thread right after the
+ * router launch, waited on by the async expert-load worker. A ring of two
+ * suffices: the start/finish protocol keeps at most one load in flight.
+ * The private non-blocking stream lets the worker read the selected ids as
+ * soon as the router output is ready instead of queueing the copy behind
+ * whatever the encode thread has enqueued since. */
+static cudaEvent_t  g_selected_readback_ev[2];
+static cudaStream_t g_selected_readback_stream = nullptr;
+static int          g_selected_readback_init = 0; /* 0=never, 1=ok, -1=failed */
+static unsigned     g_selected_readback_ev_next = 0;
+
+static int cuda_selected_readback_events_ensure(void) {
+    if (g_selected_readback_init != 0) return g_selected_readback_init > 0;
+    if (!cuda_ok(cudaEventCreateWithFlags(&g_selected_readback_ev[0],
+                                          cudaEventDisableTiming),
+                 "selected readback event 0") ||
+        !cuda_ok(cudaEventCreateWithFlags(&g_selected_readback_ev[1],
+                                          cudaEventDisableTiming),
+                 "selected readback event 1") ||
+        !cuda_ok(cudaStreamCreateWithFlags(&g_selected_readback_stream,
+                                           cudaStreamNonBlocking),
+                 "selected readback stream")) {
+        g_selected_readback_init = -1;
+        return 0;
+    }
+    g_selected_readback_init = 1;
+    return 1;
+}
+
+extern "C" int ds4_gpu_selected_readback_event_supported(void) {
+    return 1;
+}
+
 extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
-    if (event_value) *event_value = 1;
-    return cuda_ok(cudaDeviceSynchronize(), "selected readback signal");
+    if (!event_value) return 0;
+    *event_value = 0;
+    if (!cuda_selected_readback_events_ensure()) {
+        /* Event creation failed once: preserve the old full-drain
+         * semantics so the async worker still sees a ready readback. */
+        *event_value = UINT64_MAX;
+        return cuda_ok(cudaDeviceSynchronize(), "selected readback signal");
+    }
+    const unsigned idx = g_selected_readback_ev_next & 1u;
+    if (!cuda_ok(cudaEventRecord(g_selected_readback_ev[idx], 0),
+                 "selected readback record")) {
+        return 0;
+    }
+    g_selected_readback_ev_next++;
+    *event_value = (uint64_t)idx + 1u;
+    return 1;
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
@@ -28491,10 +28560,28 @@ extern "C" int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *te
                                              uint64_t bytes,
                                              uint64_t event_value,
                                              const char *label) {
-    (void)event_value;
     if (!tensor || !data || offset > tensor->bytes ||
         bytes > tensor->bytes - offset) {
         return 0;
+    }
+    if (event_value >= 1 && event_value <= 2 && g_selected_readback_init > 0) {
+        /* Copy ordered only after the recorded router event, on a private
+         * stream, so it does not wait for work enqueued afterwards. */
+        if (!cuda_ok(cudaStreamWaitEvent(g_selected_readback_stream,
+                                         g_selected_readback_ev[event_value - 1],
+                                         0),
+                     label ? label : "selected readback wait-event") ||
+            !cuda_ok(cudaMemcpyAsync(data,
+                                     (const char *)tensor->ptr + offset,
+                                     (size_t)bytes,
+                                     cudaMemcpyDeviceToHost,
+                                     g_selected_readback_stream),
+                     label ? label : "selected readback copy") ||
+            !cuda_ok(cudaStreamSynchronize(g_selected_readback_stream),
+                     label ? label : "selected readback sync")) {
+            return 0;
+        }
+        return 1;
     }
     if (!cuda_ok(cudaDeviceSynchronize(),
                  label ? label : "selected readback wait")) {
@@ -29055,7 +29142,11 @@ extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
 }
 
 extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label) {
-    (void)event_value;
+    if (event_value >= 1 && event_value <= 2 && g_selected_readback_init > 0) {
+        return cuda_ok(cudaEventSynchronize(
+                               g_selected_readback_ev[event_value - 1]),
+                       label ? label : "selected readback wait");
+    }
     return cuda_ok(cudaDeviceSynchronize(),
                    label ? label : "selected readback wait");
 }

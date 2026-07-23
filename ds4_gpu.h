@@ -85,14 +85,16 @@ int ds4_gpu_commands_active(void);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);
-#ifdef DS4_ROCM_BUILD
+/* Nonzero when the backend has native event-scoped selected-id readback
+ * (record at signal, event wait + private-stream copy at read). Backends
+ * without it fall back to wait_ready + tensor_read. */
+int ds4_gpu_selected_readback_event_supported(void);
 int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              uint64_t offset,
                                              void *data,
                                              uint64_t bytes,
                                              uint64_t event_value,
                                              const char *label);
-#endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
