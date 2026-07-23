@@ -127,6 +127,7 @@ static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
 static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
+static int g_glm_model_mode;
 
 typedef struct {
     int valid;
@@ -150,6 +151,14 @@ typedef struct {
     int32_t *slot_selected_ptr;
     uint64_t slot_selected_capacity;
     ds4_gpu_tensor slot_selected_tensor;
+    /* Direct pool read: per-compact-expert device addresses
+     * (gate,up,down triplets) into the expert pool slots. When set, the
+     * decode LUT gate/up and sum8 down kernels read weights straight
+     * from the pool and the per-layer gather into the scratch above is
+     * skipped entirely. */
+    int direct_mode;
+    unsigned long long *addr_ptr;
+    uint64_t addr_capacity;
 } cuda_stream_selected_cache;
 
 static cuda_stream_selected_cache g_stream_selected_cache;
@@ -357,6 +366,7 @@ static void cuda_fetch_readahead(const void *model_map, uint64_t model_size,
 
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
+    g_stream_selected_cache.direct_mode = 0;
 }
 
 static void cuda_stream_selected_cache_release(void) {
@@ -375,6 +385,9 @@ static void cuda_stream_selected_cache_release(void) {
     }
     if (g_stream_selected_cache.slot_selected_ptr) {
         (void)cudaFree(g_stream_selected_cache.slot_selected_ptr);
+    }
+    if (g_stream_selected_cache.addr_ptr) {
+        (void)cudaFree(g_stream_selected_cache.addr_ptr);
     }
     memset(&g_stream_selected_cache, 0, sizeof(g_stream_selected_cache));
     g_stream_selected_cache.logical_tier = -1;
@@ -17413,6 +17426,7 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
         float *mid_out,
         const char *gate_base,
         const char *up_base,
+        const unsigned long long *expert_addrs,
         const cuda_block_q8_K *xq,
         const int32_t *selected,
         const float *weights,
@@ -17436,6 +17450,12 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
      * read. */
     if (expert_i < 0) return;
     uint32_t expert = (uint32_t)expert_i;
+    const char *gexp = expert_addrs ?
+        (const char *)(uintptr_t)expert_addrs[expert * 3u + 0u] :
+        gate_base + (uint64_t)expert * gate_expert_bytes;
+    const char *uexp = expert_addrs ?
+        (const char *)(uintptr_t)expert_addrs[expert * 3u + 1u] :
+        up_base + (uint64_t)expert * gate_expert_bytes;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[24];
     __shared__ uint64_t s_iq2_grid[256];
@@ -17450,8 +17470,8 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     for (uint32_t rr = 0; rr < MOE_DECODE_ROW_TILES; rr++) {
         uint32_t row = blockIdx.x * MOE_DECODE_ROWS_PER_BLOCK + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
-        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gexp + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(uexp + (uint64_t)row * gate_row_bytes);
         float gate = 0.0f;
         float up = 0.0f;
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
@@ -19050,6 +19070,7 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile8_rowspan_kernel(
 __global__ static void moe_down_sum8_iq2xxs_lut_qwarp32_kernel(
         float *out,
         const char *down_base,
+        const unsigned long long *expert_addrs,
         const cuda_block_q8_K *midq,
         const int32_t *selected,
         uint64_t down_expert_bytes,
@@ -19073,9 +19094,11 @@ __global__ static void moe_down_sum8_iq2xxs_lut_qwarp32_kernel(
         if (!((owned_mask >> slot) & 1u)) continue;
         int32_t expert_i = selected[slot];
         if (expert_i < 0) continue;
+        const char *dexp = expert_addrs ?
+            (const char *)(uintptr_t)expert_addrs[(uint32_t)expert_i * 3u + 2u] :
+            down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes;
         const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)
-            (down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes +
-             (uint64_t)row * down_row_bytes);
+            (dexp + (uint64_t)row * down_row_bytes);
         const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
         float acc = 0.0f;
         for (uint32_t b = lane; b < midq_blocks; b += 8u)
@@ -21416,6 +21439,27 @@ static int routed_moe_launch(
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u && xq_blocks <= 24u &&
             getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL;
+        /* Direct pool read staged by begin_load: the gather was skipped,
+         * so the LUT gate/up + sum8 down pair MUST run with the address
+         * table; any other kernel path here would read stale scratch. */
+        const unsigned long long *direct_addrs = NULL;
+        if (use_stream_selected_cache && g_stream_selected_cache.direct_mode) {
+            if (n_tokens == 1u && use_decode_lut_gate && iq2_down_path &&
+                n_expert == 8u && g_stream_selected_cache.addr_ptr) {
+                direct_addrs = g_stream_selected_cache.addr_ptr;
+            } else {
+                fprintf(stderr,
+                        "ds4: CUDA pool direct-read staged for an incompatible MoE path "
+                        "(layer %u n_tokens %u lut_gate %u iq2_down %u n_expert %u)\n",
+                        layer_index, n_tokens, use_decode_lut_gate,
+                        iq2_down_path, n_expert);
+                if (profile_moe) {
+                    for (uint32_t i = 0; i < 7u; i++)
+                        if (prof_ev[i]) (void)cudaEventDestroy(prof_ev[i]);
+                }
+                return 0;
+            }
+        }
         const uint32_t gate_row_span =
             getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ? 2048u :
             getenv("DS4_CUDA_MOE_GATE_ROW1024") != NULL ? 1024u : 512u;
@@ -22006,6 +22050,7 @@ static int routed_moe_launch(
                         (float *)mid->ptr,
                         gate_w,
                         up_w,
+                        direct_addrs,
                         xq,
                         (const int32_t *)selected->ptr,
                         (const float *)weights->ptr,
@@ -22125,6 +22170,7 @@ static int routed_moe_launch(
                         moe_down_sum8_iq2xxs_lut_qwarp32_kernel<<<sgrid, 256>>>(
                             (float *)out->ptr,
                             down_w,
+                            direct_addrs,
                             midq,
                             (const int32_t *)selected->ptr,
                             down_expert_bytes,
@@ -23650,6 +23696,21 @@ static int cuda_stream_selected_cache_begin_load(
         cuda_fetch_readahead(table->model_map, table->model_size,
                              fetch_jobs.data(), (uint32_t)fetch_jobs.size());
     }
+    /* Direct pool read: engaged only when every compact expert holds a
+     * pool slot, on the GLM decode/token path whose LUT gate/up + sum8
+     * down kernels accept per-expert addresses. Any fallback env that
+     * restores an older kernel path keeps the gather instead. */
+    unsigned long long direct_addrs_host[24];
+    int direct_ok = pool_ok && pool_insert && g_glm_model_mode &&
+                    compact_ids.size() <= 8u &&
+                    getenv("DS4_CUDA_NO_POOL_DIRECT_READ") == NULL &&
+                    getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL &&
+                    getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
+    if (direct_ok) {
+        for (uint32_t i = 0; i < compact_ids.size(); i++) {
+            if (pool_slot[i] == UINT32_MAX) { direct_ok = 0; break; }
+        }
+    }
     for (uint32_t i = 0; i < compact_ids.size(); i++) {
         const uint64_t expert = (uint32_t)compact_ids[i];
         const uint64_t gate_src =
@@ -23693,6 +23754,19 @@ static int cuda_stream_selected_cache_begin_load(
                     cuda_stream_selected_cache_invalidate();
                     return 0;
                 }
+            }
+            if (direct_ok) {
+                /* Kernels read the pool slot directly. Clock second-chance
+                 * keeps recently-referenced slots off the victim list far
+                 * longer than the 1-2 layers of in-flight stream work —
+                 * the same reuse window the gather already tolerated. */
+                direct_addrs_host[i * 3u + 0u] =
+                    (unsigned long long)(uintptr_t)pg;
+                direct_addrs_host[i * 3u + 1u] =
+                    (unsigned long long)(uintptr_t)pu;
+                direct_addrs_host[i * 3u + 2u] =
+                    (unsigned long long)(uintptr_t)pd;
+                continue;
             }
             /* Device-to-device gather into the compact scratch on the
              * legacy stream: ordered ahead of the consuming kernels, no
@@ -23752,6 +23826,21 @@ static int cuda_stream_selected_cache_begin_load(
         cuda_stream_selected_cache_invalidate();
         return 0;
     }
+    if (direct_ok) {
+        const uint64_t addr_bytes =
+            (uint64_t)compact_count * 3u * sizeof(unsigned long long);
+        if (!cuda_stream_selected_ensure_bytes(
+                    (char **)&g_stream_selected_cache.addr_ptr,
+                    &g_stream_selected_cache.addr_capacity,
+                    addr_bytes, "expert addrs") ||
+            !cuda_ok(cudaMemcpy(g_stream_selected_cache.addr_ptr,
+                                direct_addrs_host, (size_t)addr_bytes,
+                                cudaMemcpyHostToDevice),
+                     "expert addr table copy")) {
+            cuda_stream_selected_cache_invalidate();
+            return 0;
+        }
+    }
 
     g_stream_selected_cache.logical_tier = logical_tier;
     g_stream_selected_cache.model_map = table->model_map;
@@ -23770,6 +23859,7 @@ static int cuda_stream_selected_cache_begin_load(
         (uint64_t)slot_count * sizeof(int32_t);
     g_stream_selected_cache.slot_selected_tensor.owner = 0;
     g_stream_selected_cache.slot_selected_tensor.device_id = logical_tier;
+    g_stream_selected_cache.direct_mode = direct_ok;
     g_stream_selected_cache.valid = 1;
     return 1;
 }
@@ -29184,7 +29274,7 @@ extern "C" int ds4_gpu_preload_q4_expert_tables(
 }
 
 extern "C" void ds4_gpu_set_glm_model(bool enabled) {
-    (void)enabled;
+    g_glm_model_mode = enabled ? 1 : 0;
 }
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
