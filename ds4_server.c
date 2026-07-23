@@ -4798,9 +4798,15 @@ static bool parse_deepseek_generated_message_ex(const char *text,
     if (require_thinking_closed) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
-            /* Model did not close thinking, ignore any DSML in reasoning */
+            /* Thinking mode is on but the model never emitted </think> —
+             * typically truncated at max_tokens mid-thought. The text is
+             * unfinished reasoning, not a final answer: surface it all as
+             * reasoning_content with empty content, and execute no DSML
+             * from unfinished reasoning (upstream PR #524). */
             fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            size_t think_off = !strncmp(text, "<think>", 7) ? 7 : 0;
+            *reasoning_out = xstrdup(text + think_off);
+            *content_out = xstrdup("");
             return true;
         }
         tool_search = think_end + 8;
@@ -4985,7 +4991,14 @@ static bool parse_glm_generated_message_ex(const char *text,
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
             fprintf(stderr, "ds4-server: thinking not closed, ignoring GLM tool calls in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            /* Same unfinished-reasoning semantics as the DSML path above
+             * (upstream PR #524). */
+            {
+                size_t think_off = !strncmp(text, "<think>", 7) ? 7 : 0;
+                *reasoning_out = xstrdup(text + think_off);
+                *content_out = xstrdup("");
+                return true;
+            }
             return true;
         }
         tool_search = think_end + 8;
