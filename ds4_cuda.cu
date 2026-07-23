@@ -1514,6 +1514,12 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
     if (g_model_device_owned || g_model_registered) return 1;
+    /* On the HMM direct path (coherent unified memory, e.g. GB10
+     * NVLink-C2C) every range is immediately accessible. Ported from
+     * upstream PR #158; the full-model prefetch half of that PR is
+     * deliberately NOT ported — prefetching a model larger than RAM
+     * would thrash the page cache on SSD-streaming boxes. */
+    if (g_model_hmm_direct) return 1;
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
