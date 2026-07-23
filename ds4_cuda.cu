@@ -27360,12 +27360,66 @@ __device__ __forceinline__ float2 glm_cache_value_pair_dev<float>(
     return *(const float2 *)p;
 }
 
+/* Gather the indexer-selected compact rows into contiguous scratch with the
+ * rope pairs pre-rotated (theta needs the TRUE row id, so it is applied here
+ * once per row instead of once per head). Kills the n_head x n_selected
+ * scattered re-reads over the ~104 MB/layer f32 compact cache that dominate
+ * decode attention at deep context; per-element arithmetic matches the
+ * in-kernel path, so downstream scores are unchanged. */
+template <typename CT>
+__global__ static void glm_attention_decode_gather_kernel(
+        float *lora_out,
+        float *rope_out,
+        const CT *kv_lora_cache,
+        const CT *k_rope_cache,
+        const uint32_t *selected,
+        uint32_t n_selected,
+        uint32_t cache_cap,
+        uint32_t kv_lora_dim,
+        uint32_t qk_rope,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    const uint32_t s = blockIdx.x;
+    if (s >= n_selected) return;
+    const uint32_t row = selected[s];
+    if (row >= cache_cap) return; /* consumers re-check via selected[s] */
+    const uint32_t tid = threadIdx.x;
+    float corr_dims[2] = {0.0f, 0.0f};
+    if (ext_factor != 0.0f) {
+        corr_dims[0] = fmaxf(0.0f,
+            floorf(glm_rope_yarn_corr_factor_dev((int)qk_rope,
+                    (int)n_ctx_orig, beta_fast, freq_base)));
+        corr_dims[1] = fminf((float)qk_rope - 1.0f,
+            ceilf(glm_rope_yarn_corr_factor_dev((int)qk_rope,
+                    (int)n_ctx_orig, beta_slow, freq_base)));
+    }
+    const uint64_t lora_src = (uint64_t)row * kv_lora_dim;
+    const uint64_t lora_dst = (uint64_t)s * kv_lora_dim;
+    for (uint32_t j = tid; j < kv_lora_dim; j += blockDim.x) {
+        lora_out[lora_dst + j] = (float)kv_lora_cache[lora_src + j];
+    }
+    const uint64_t rope_src = (uint64_t)row * qk_rope;
+    const uint64_t rope_dst = (uint64_t)s * qk_rope;
+    for (uint32_t r = tid * 2u; r < qk_rope; r += blockDim.x * 2u) {
+        const float2 y = glm_cache_rope_pair_f16_dev<CT>(
+                k_rope_cache, rope_src, r, row, qk_rope,
+                freq_base, freq_scale, ext_factor, attn_factor, corr_dims);
+        rope_out[rope_dst + r] = y.x;
+        rope_out[rope_dst + r + 1u] = y.y;
+    }
+}
+
 /* Exact staged decode attention. The original fused kernel owns one block per
  * head, which leaves more than half of an L40S idle. These stages preserve the
  * fused kernel's arithmetic order for every score, softmax lane, lora output,
  * and value-projection row while exposing independent rows/dimensions as
  * separate blocks. */
-template <typename CT, bool RANGE_TOK2 = false>
+template <typename CT, bool RANGE_TOK2 = false, bool PREGATHERED = false>
 __global__ static void glm_attention_decode_weights_staged_kernel(
         float *weights,
         float *denom,
@@ -27417,9 +27471,12 @@ __global__ static void glm_attention_decode_weights_staged_kernel(
 
     float local_max = -FLT_MAX;
     for (uint32_t s = tid; s < row_count; s += nth) {
-        const uint32_t row = RANGE_TOK2 ? s : selected[s];
+        /* PREGATHERED: data reads hit the contiguous gather scratch at s;
+         * the true row id is kept only for the validity check. */
+        const uint32_t row = (RANGE_TOK2 || PREGATHERED) ? s : selected[s];
+        const uint32_t valid_row = PREGATHERED ? selected[s] : row;
         float score = -FLT_MAX;
-        if (row < cache_cap) {
+        if (valid_row < cache_cap) {
             float dotv = 0.0f;
             const uint64_t lora_base = (uint64_t)row * kv_lora_dim;
             if (score_vec2) {
@@ -27437,7 +27494,10 @@ __global__ static void glm_attention_decode_weights_staged_kernel(
             }
             const uint64_t rope_base = (uint64_t)row * qk_rope;
             for (uint32_t r = 0; r < qk_rope; r += 2u) {
-                const float2 y = glm_cache_rope_pair_f16_dev<CT>(
+                const float2 y = PREGATHERED ?
+                    *(const float2 *)((const float *)k_rope_cache +
+                                      rope_base + r) :
+                    glm_cache_rope_pair_f16_dev<CT>(
                         k_rope_cache, rope_base, r, row, qk_rope,
                         freq_base, freq_scale, ext_factor, attn_factor,
                         corr_dims);
@@ -27478,7 +27538,7 @@ __global__ static void glm_attention_decode_weights_staged_kernel(
     }
 }
 
-template <typename CT, bool RANGE_TOK2 = false>
+template <typename CT, bool RANGE_TOK2 = false, bool PREGATHERED = false>
 __global__ static void glm_attention_decode_lora_staged_kernel(
         float *lora_sum,
         const float *scores,
@@ -27501,8 +27561,9 @@ __global__ static void glm_attention_decode_lora_staged_kernel(
     float acc0 = 0.0f;
     float acc1 = 0.0f;
     for (uint32_t s = 0; s < row_count; s++) {
-        const uint32_t row = RANGE_TOK2 ? s : selected[s];
-        if (row < cache_cap) {
+        const uint32_t row = (RANGE_TOK2 || PREGATHERED) ? s : selected[s];
+        const uint32_t valid_row = PREGATHERED ? selected[s] : row;
+        if (valid_row < cache_cap) {
             const float2 v = glm_cache_value_pair_dev(
                     kv_lora_cache + (uint64_t)row * kv_lora_dim + j);
             const float w = head_scores[s];
@@ -27862,18 +27923,63 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
                 UINT64_MAX / sizeof(float)) {
             return 0;
         }
+        const int gather_rows = !range_tok2 && n_selected >= 1024u &&
+                                getenv("DS4_GLM_NO_ATTN_GATHER") == NULL;
+        const uint64_t gather_count = gather_rows ?
+            (uint64_t)n_selected * (kv_lora_dim + qk_rope) : 0u;
         const uint64_t scratch_bytes =
-            (score_count + head_count + lora_count) * sizeof(float);
+            (score_count + head_count + lora_count + gather_count) *
+            sizeof(float);
         float *scratch = (float *)cuda_tmp_alloc_on(
                 ds4_tensor_device_idx(heads), scratch_bytes,
                 "glm staged decode attention");
         if (!scratch) return 0;
         float *softmax_denom = scratch + score_count;
         float *lora_sum = softmax_denom + head_count;
+        float *gathered = lora_sum + lora_count;
+        float *gathered_rope = gathered + (uint64_t)n_selected * kv_lora_dim;
+        if (gather_rows) {
+            if (cache_f16) {
+                glm_attention_decode_gather_kernel<__half>
+                        <<<n_selected, 128>>>(
+                        gathered, gathered_rope,
+                        (const __half *)kv_lora_cache->ptr,
+                        (const __half *)k_rope_cache->ptr,
+                        (const uint32_t *)selected->ptr,
+                        n_selected, cache_cap, kv_lora_dim, qk_rope,
+                        n_ctx_orig, freq_base, freq_scale, ext_factor,
+                        attn_factor, beta_fast, beta_slow);
+            } else {
+                glm_attention_decode_gather_kernel<float>
+                        <<<n_selected, 128>>>(
+                        gathered, gathered_rope,
+                        (const float *)kv_lora_cache->ptr,
+                        (const float *)k_rope_cache->ptr,
+                        (const uint32_t *)selected->ptr,
+                        n_selected, cache_cap, kv_lora_dim, qk_rope,
+                        n_ctx_orig, freq_base, freq_scale, ext_factor,
+                        attn_factor, beta_fast, beta_slow);
+            }
+            if (!cuda_ok(cudaGetLastError(),
+                         "glm staged decode gather launch")) {
+                return 0;
+            }
+        }
         const uint32_t weight_shmem =
             (256u + score_stride) * (uint32_t)sizeof(float);
         const dim3 weight_grid(n_head, token_count, 1u);
-        if (cache_f16 && range_tok2) {
+        if (gather_rows) {
+            glm_attention_decode_weights_staged_kernel<float, false, true>
+                    <<<weight_grid, 256, weight_shmem>>>(
+                    scratch, softmax_denom, (const float *)q->ptr,
+                    (const float *)qk_low->ptr,
+                    gathered, gathered_rope,
+                    (const uint32_t *)selected->ptr,
+                    n_selected, cache_cap, n_head, kv_lora_dim,
+                    qk_nope, qk_rope, scale, n_ctx_orig, freq_base,
+                    freq_scale, ext_factor, attn_factor, beta_fast,
+                    beta_slow, score_vec2);
+        } else if (cache_f16 && range_tok2) {
             glm_attention_decode_weights_staged_kernel<__half, true>
                     <<<weight_grid, 256, weight_shmem>>>(
                     scratch, softmax_denom, (const float *)q->ptr,
@@ -27928,7 +28034,14 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         }
         dim3 lora_grid((kv_lora_dim / 2u + 63u) / 64u,
                        n_head, token_count);
-        if (cache_f16 && range_tok2) {
+        if (gather_rows) {
+            glm_attention_decode_lora_staged_kernel<float, false, true>
+                    <<<lora_grid, 64>>>(
+                    lora_sum, scratch, softmax_denom,
+                    gathered,
+                    (const uint32_t *)selected->ptr,
+                    n_selected, cache_cap, n_head, kv_lora_dim);
+        } else if (cache_f16 && range_tok2) {
             glm_attention_decode_lora_staged_kernel<__half, true>
                     <<<lora_grid, 64>>>(
                     lora_sum, scratch, softmax_denom,

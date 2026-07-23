@@ -228,3 +228,156 @@ Checklist (each step ends runnable):
    frozen pool size printed by grow (250-255) for the OOM-ordering note.
 6. (Separate, from ask 5) `DS4_METAL_DECODE_STAGE_PROFILE=1` at 2k vs 45k to
    split indexer_scores vs indexer_topk before any kernel work.
+
+## ATTENTION-GROWTH INVESTIGATION (pass 2)
+
+Question: decode 'attention' stage grows 63.9 ms/token (2k ctx) -> ~90 ms/token
+(45k ctx) even though the indexed attention core is bounded to 2048 selected
+rows. Verdict: **(b) scattered-read locality over the larger compact cache**,
+plus a clean bill of health for the profiler bracket. Detail below.
+
+### 1. The bracket is clean — no hidden O(ctx) work
+
+- Macro: `DS4_GLM_PROFILE_DECODE_STAGE` (ds4.c:45590-45594) calls
+  `metal_graph_layer_stage_profile_boundary` (ds4.c:26576-26597), which does
+  `ds4_gpu_end_commands()` (full GPU sync) at every stage marker — so each
+  bucket measures exactly the GPU work submitted since the previous marker.
+- The 'attention' marker is ds4.c:46040. In the indexed path the previous
+  marker is "kv_path" at ds4.c:45914 (which itself closes over
+  `ds4_gpu_glm_qk_lowrank_typed_tensor`, ds4.c:45898 — so qk_lowrank is NOT
+  in the attention bucket). Between 45914 and 46040 the only submitted work
+  is the indexed attention core call (ds4.c:45920-45981). indexer_scores /
+  indexer_topk / indexer_select all close at their own markers
+  (ds4.c:45883/45889/45896). No expert staging, no cache build, no O(ctx)
+  call sneaks inside this window. (The non-indexed else-branch content at
+  46004-46038 has its own "kv_cache" marker at 46026 and is not taken when
+  `use_indexed_attention` is set.)
+
+### 2. Which kernel actually runs on CUDA
+
+- The split_group8 branch (ds4.c:45920) is **dead on CUDA**:
+  `glm_graph_indexed_decode_split_group8_available` requires
+  `glm_graph_compact_cache_is_f16()` (ds4.c:37827), and
+  `DS4_GPU_ATTN_COMP_CACHE_F16` is 1 only under `__APPLE__`
+  (ds4.c:14825-14829) — on CUDA the compact cache is **f32**. The CUDA entry
+  point is a stub anyway (ds4_cuda.cu:24363-24396, prints "CUDA stub
+  called"), which is never reached because available() is false.
+- So the fallback `ds4_gpu_glm_attention_indexed_decode_typed_tensor`
+  (ds4_cuda.cu:24808) runs, and with n_selected = 2048 >= 512 it takes the
+  **staged 3-kernel path** (ds4_cuda.cu:24918-25050):
+  1. `glm_attention_decode_weights_staged_kernel` (24438): grid = n_head
+     blocks x 256 threads; each thread walks whole selected rows:
+     `row = selected[s]`, then reads `kv_lora_cache[row*512 + j]` for
+     j=0..511 (f32, 2048 B) plus the 64-dim rope tail (256 B) — 24489-24516.
+  2. `glm_attention_decode_lora_staged_kernel` (24551): re-reads all 2048
+     selected lora rows (`kv_lora_cache[row*512 + j]`, 24573-24576).
+  3. `glm_attention_decode_value_staged_kernel` (24588): model weights only,
+     ctx-independent.
+- Loop trip counts are all bounded by n_selected (<= 2048). **There is no
+  O(ctx) loop anywhere in the attention core.** Scratch comes from the
+  reused `cuda_tmp_alloc_on` slab (ds4_cuda.cu:656-675) — no per-call
+  cudaMalloc growth with ctx.
+
+### 3. Why it still gets slower with context: selected-row layout
+
+- At 2k ctx, `visible <= indexer_top_k`, so every full-indexer layer takes
+  the `ds4_gpu_glm_fill_selected_range_tensor` branch (ds4.c:45822-45826):
+  `selected[s] = s` — the gather degenerates to a **sequential scan of a
+  ~4.7 MB contiguous window** (2048 rows x 2304 B f32 row = 512x4 lora +
+  64x4 rope). All n_head blocks re-read the same window; it fits L2; pages
+  are contiguous.
+- At 45k ctx, selected comes from the tree-merge topk
+  (`ds4_gpu_indexer_topk_tensor` 2048-wide path, ds4_cuda.cu:12040-12108) —
+  indices are neither ascending nor clustered. The same 4.7 MB of useful
+  data is now **scattered as 2 KB rows across a ~104 MB per-layer arena**
+  (cache_cap x 2304 B; x61 layers ~= the multi-GiB compact cache). The
+  weights-stage access pattern makes this expensive: within a warp, the 32
+  threads hold 32 *different* rows and issue 8 B loads at matching j offsets
+  (24489-24504) — i.e. 32-way-scattered 8 B transactions. Sequential
+  selection hides this (neighbor threads' rows are adjacent -> transactions
+  coalesce across the warp and prefetch/DRAM row-buffer friendly); random
+  selection turns every load into an independent DRAM page + TLB touch.
+- Bandwidth math confirms it is a latency/locality effect, not capacity:
+  bounded traffic is only ~9 MB/layer (~550 MB/token over 61 layers, ~2 ms
+  at LPDDR5x streaming rates), yet the bucket costs 64-90 ms — the kernel
+  is memory-*latency* bound (plus per-head-block yarn `powf`/`sincos`
+  recompute in `glm_cache_rope_pair_f16_dev`, ds4_cuda.cu:24051-24063,
+  which is ctx-independent and explains the high flat baseline). The
+  2k->45k delta (~26 ms/token) is the scattered-vs-sequential penalty.
+
+### 4. Fix assessment: gather-to-contiguous scratch — worth it
+
+Cost: gather 2048 rows x 2304 B (f32 on CUDA; the 576 B/1.2 MB figure in
+the ask assumed the Apple f16 cache) ~= 4.7 MB per layer, read-scattered +
+write-streamed once, then both consumer stages stream. A row-granularity
+copy (one block per row, coalesced 2 KB reads) is the *friendly* way to eat
+the scatter — est. ~2-3 ms/token total added across 61 layers, replacing a
+~26 ms/token penalty. **Expected net win ~15-25 ms/token at 45k, ~0 at 2k**
+(and the gather can be skipped entirely when the host used the
+fill-selected-range path, since rows are already sequential).
+
+Existing code to clone:
+- Row-gather-by-index into compact scratch: `glm_moe_gemm_gather_x_f16_kernel`
+  (ds4_cuda.cu:26615) — same shape (grid over rows, coalesced per-row copy).
+- Sequential-row addressing already exists in the consumers as the
+  `RANGE_TOK2` template arm (`row = s`, 24489/24573) — the gathered mode is
+  the same addressing with the token-y-dim semantics removed.
+
+Constraint (important): rope rotation is position-dependent —
+`theta_base = (float)row` (ds4_cuda.cu:24055). Two exact-numerics options:
+  (a) smallest change: consumers address the gathered scratch with `row = s`
+      but keep reading `selected[s]` solely for theta (selected is 8 KB,
+      L2-resident, cheap);
+  (b) better: pre-rotate the 64-dim rope tail in the gather kernel using the
+      true row id (identical per-element arithmetic `x0*ct - x1*st`, stored
+      f32 -> bit-identical downstream) — this also deletes the n_head-fold
+      redundant `powf`/`sincos` per row and should cut the flat baseline too.
+
+Smallest-change implementation sketch (all in
+`ds4_gpu_glm_attention_indexed_decode_typed_tensor`, ds4_cuda.cu:24918-25050):
+1. Extend `scratch_bytes` (24934) by `n_selected*(kv_lora_dim+qk_rope)`
+   floats. Do NOT make a second `cuda_tmp_alloc_on` call — it returns the
+   same slab (ds4_cuda.cu:656-675); carve the gather region from the one
+   allocation.
+2. Add `glm_attention_decode_gather_rows_kernel` (clone of 26615): grid
+   (n_selected), 256 threads; copy lora row + rope tail (option (b): rotate
+   rope while copying) from `kv_lora_cache`/`k_rope_cache` at
+   `selected[s]` into scratch row s. f16->f32 conversion in the same pass
+   keeps the Apple path uniform if ever shared.
+3. Add a `GATHERED` template arm (or reuse/rename the `row = s` addressing
+   of RANGE_TOK2) to `glm_attention_decode_weights_staged_kernel` and
+   `glm_attention_decode_lora_staged_kernel`; pass the scratch pointers with
+   cache_cap = n_selected. Gate with `DS4_GLM_ATTN_NO_GATHER` env; leave the
+   `range_tok2` (MTP verify) path on the old code initially.
+4. Host-side skip: when the layer used the fill-selected-range path (host
+   already knows: `visible <= indexer_top_k` at ds4.c:45822 or the indexer
+   ablation at 45827), selection is sequential — bypass the gather.
+
+Validation checklist:
+- Zero-code pre-confirmation (do this FIRST): run 45k-ctx decode with
+  `DS4_GLM_DECODE_ABLATE=indexer` (ds4.c:39974, 45827-45832 — fills
+  selected with 0..2047 sequential, "downstream attention timing stays
+  real"). If the 'attention' bucket falls back to ~64 ms/token, the
+  scattered-gather diagnosis is confirmed before writing any CUDA.
+- Bit-exactness: heads output identical with gather on vs off
+  (`DS4_GLM_ATTN_NO_GATHER=1`) at 2k and 45k; token-for-token text identity
+  on a long decode. Option (b) rope pre-rotation must also be bit-identical
+  (same per-element ops, f32 round-trip exact) — verify explicitly.
+- Perf: `DS4_METAL_DECODE_STAGE_PROFILE=1` attention bucket at 2k (expect
+  no regression; gather skipped) and 45k (expect ~64-70 ms/token).
+- MTP verify mode (`g_glm_mtp_verify_mode`, range_tok2 branch 24871-24917)
+  unchanged; staged tok2 path still bitwise-identical.
+- TP two-rank pipeline at 45k unaffected (attention core is per-rank local).
+
+## ABLATION CONFIRMATION (2026-07-23)
+DS4_GLM_DECODE_ABLATE=indexer @45k: attention 89.8 -> 69.3 ms (~21 ms =
+scatter locality confirmed; log 2026-07-23_attn_ablate.log). PROCEED with
+gather-to-scratch per the pass-2 sketch: new gather kernel (2048 rows x
+2304 B f32 -> contiguous scratch, selection order, rope pre-rotated using
+true row id read during gather), staged attention kernels then read
+scratch sequentially and skip rope; bypass gather when selection is a
+contiguous range (shallow ctx / ablate path); env DS4_GLM_NO_ATTN_GATHER
+to disable. Clone glm_moe_gemm_gather_x_f16_kernel (ds4_cuda.cu:26615)
+as the pattern. Validate: text identity 3k + 45k coherent + argmax band,
+then steady-state stage profile (expect attention ~70, total ~330,
+~3.0 t/s @45k).
