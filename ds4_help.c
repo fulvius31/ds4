@@ -212,6 +212,8 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
         opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");
         opt(fp, c, "--prompt-file FILE", "Read one-shot prompt text from FILE.");
         opt(fp, c, "--raw-prompt", "Tokenize the one-shot prompt without chat markers.");
+        opt(fp, c, "--kv-load FILE", "Restore a saved KV session; the prompt continues that conversation.");
+        opt(fp, c, "--kv-save FILE", "Save the session KV to FILE after the run. Works on distributed coordinators.");
     }
     fputc('\n', fp);
 }

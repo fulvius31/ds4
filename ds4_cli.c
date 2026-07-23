@@ -99,6 +99,12 @@ typedef struct {
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
+    /* Session KV persistence: restore before the prompt, save after the run.
+     * Both ride ds4_session_save/load_payload, which is topology-neutral —
+     * on a distributed coordinator the worker shards are gathered/pushed
+     * over the control connection. */
+    const char *kv_load_path;
+    const char *kv_save_path;
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
@@ -302,6 +308,70 @@ static double cli_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+}
+
+static int cli_kv_save_file(ds4_session *session, const char *path) {
+    if (!session) {
+        fprintf(stderr, "ds4: no active session to save\n");
+        return 1;
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to create %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    char err[256];
+    const double t0 = cli_now_sec();
+    int rc = ds4_session_save_payload(session, fp, err, sizeof(err));
+    const long bytes = ftell(fp);
+    if (fclose(fp) != 0 && rc == 0) {
+        snprintf(err, sizeof(err), "failed to flush %s: %s", path, strerror(errno));
+        rc = 1;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "ds4: KV save failed: %s\n", err);
+        remove(path);
+        return 1;
+    }
+    const ds4_tokens *toks = ds4_session_tokens(session);
+    ds4_log(stderr, DS4_LOG_OK,
+            "ds4: KV session saved: %s (%.2f GiB, %d tokens, %.1fs)\n",
+            path, bytes > 0 ? (double)bytes / 1073741824.0 : 0.0,
+            toks ? toks->len : 0, cli_now_sec() - t0);
+    return 0;
+}
+
+static int cli_kv_load_file(ds4_session *session, const char *path) {
+    if (!session) {
+        fprintf(stderr, "ds4: no active session for KV restore\n");
+        return 1;
+    }
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to open %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    long size = -1;
+    if (fseek(fp, 0, SEEK_END) == 0) size = ftell(fp);
+    if (size <= 0 || fseek(fp, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "ds4: %s is empty or not seekable\n", path);
+        fclose(fp);
+        return 1;
+    }
+    char err[256];
+    const double t0 = cli_now_sec();
+    const int rc = ds4_session_load_payload(session, fp, (uint64_t)size, err, sizeof(err));
+    fclose(fp);
+    if (rc != 0) {
+        fprintf(stderr, "ds4: KV restore failed: %s\n", err);
+        return 1;
+    }
+    const ds4_tokens *toks = ds4_session_tokens(session);
+    ds4_log(stderr, DS4_LOG_OK,
+            "ds4: KV session restored: %s (%.2f GiB, %d tokens, %.1fs)\n",
+            path, (double)size / 1073741824.0,
+            toks ? toks->len : 0, cli_now_sec() - t0);
+    return 0;
 }
 
 static char *read_prompt_file(const char *path, bool fatal);
@@ -534,6 +604,26 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
     char err[160];
     ds4_think_mode think_mode = cli_effective_think_mode(&cfg->gen);
+
+    /* --kv-load: restore a saved session, then treat the prompt as the next
+     * user turn of the restored conversation.  The restored prefix is a
+     * common prefix of the sync target, so only the new turn prefills. */
+    ds4_tokens continuation = {0};
+    const ds4_tokens *sync_target = prompt;
+    int restored_tokens = 0;
+    if (cfg->kv_load_path) {
+        if (cli_kv_load_file(session, cfg->kv_load_path) != 0) {
+            ds4_session_free(session);
+            return 1;
+        }
+        const ds4_tokens *saved = ds4_session_tokens(session);
+        if (saved) ds4_tokens_copy(&continuation, saved);
+        restored_tokens = continuation.len;
+        ds4_chat_append_message(engine, &continuation, "user", cfg->gen.prompt);
+        ds4_chat_append_assistant_prefix(engine, &continuation, think_mode);
+        sync_target = &continuation;
+    }
+
     token_printer printer = {
         .engine = engine,
         .fp = stdout,
@@ -543,8 +633,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         .last_output_newline = true,
     };
     cli_prefill_progress progress = {
-        .base_tokens = 0,
-        .input_tokens = prompt->len,
+        .base_tokens = restored_tokens,
+        .input_tokens = sync_target->len - restored_tokens,
         .use_color = ds4_log_is_tty(stderr),
     };
 
@@ -554,12 +644,13 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
     cli_dist_busy_set(cfg, true);
-    int sync_rc = ds4_session_sync(session, prompt, err, sizeof(err));
+    int sync_rc = ds4_session_sync(session, sync_target, err, sizeof(err));
     cli_dist_busy_set(cfg, false);
     if (sync_rc != 0) {
         ds4_session_set_progress(session, NULL, NULL);
         ds4_session_set_display_progress(session, NULL, NULL);
         fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
+        ds4_tokens_free(&continuation);
         ds4_session_free(session);
         return 1;
     }
@@ -661,11 +752,16 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     ds4_log(stderr,
             DS4_LOG_TIMING,
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
-            prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
+            prefill_s > 0.0 ? (double)(sync_target->len - restored_tokens) / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
 
+    int final_rc = 0;
+    if (cfg->kv_save_path && cli_kv_save_file(session, cfg->kv_save_path) != 0) {
+        final_rc = 1;
+    }
+    ds4_tokens_free(&continuation);
     ds4_session_free(session);
-    return 0;
+    return final_rc;
 }
 
 static bool json_utf8_valid(const char *s, size_t n) {
@@ -1225,6 +1321,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             cfg->engine.tp.role == DS4_TP_LEADER ||
             getenv("DS4_CLI_FORCE_SESSION") != NULL ||
             cfg->gen.temperature > 0.0f ||
+            cfg->kv_load_path || cfg->kv_save_path ||
             ds4_engine_mtp_draft_tokens(engine) > 1) {
             /* TP leaders always drive the session path: the sync/eval
              * mirroring that keeps the worker in lockstep lives there.
@@ -1276,6 +1373,8 @@ static void print_repl_help(void) {
     puts("  /ctx N         Set context size for following prompts.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /read FILE     Read a prompt from FILE and run it.");
+    puts("  /save FILE     Save the session KV cache to FILE.");
+    puts("  /load FILE     Restore a session KV cache saved with /save.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
 }
@@ -1355,6 +1454,10 @@ static void repl_chat_build_think_prefix(ds4_engine *engine,
 static void repl_chat_apply_think_prefix(ds4_engine *engine,
                                          repl_chat *chat,
                                          ds4_think_mode mode) {
+    /* A restored session keeps the thinking prefix it was saved with:
+     * rewriting tokens near the start of the transcript would invalidate
+     * every restored KV row and force a full re-prefill. */
+    if (chat->think_prefix_pos < 0) return;
     ds4_tokens prefix = {0};
     repl_chat_build_think_prefix(engine, mode, &prefix);
 
@@ -1386,6 +1489,18 @@ static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx
     return 0;
 }
 
+static int repl_restore_kv(repl_chat *chat, const char *path) {
+    if (cli_kv_load_file(chat->session, path) != 0) return 1;
+    chat->transcript.len = 0;
+    const ds4_tokens *saved = ds4_session_tokens(chat->session);
+    if (saved) tokens_insert(&chat->transcript, 0, saved);
+    chat->think_prefix_pos = -1;
+    chat->think_prefix_tokens = 0;
+    printf("Restored %d tokens of context; thinking mode is fixed to the saved session's.\n",
+           chat->transcript.len);
+    return 0;
+}
+
 static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config *cfg) {
     memset(chat, 0, sizeof(*chat));
     ds4_chat_begin(engine, &chat->transcript);
@@ -1394,7 +1509,10 @@ static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config 
     if (cfg->gen.system && cfg->gen.system[0]) {
         ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
     }
-    return repl_chat_create_session(engine, chat, cfg->gen.ctx_size);
+    if (repl_chat_create_session(engine, chat, cfg->gen.ctx_size) != 0) return 1;
+    /* On a distributed coordinator the first turn (or a --kv-load restore)
+     * needs the worker route up, exactly like one-shot generation. */
+    return cli_wait_distributed_route(cfg, chat->session);
 }
 
 static void repl_chat_free(repl_chat *chat) {
@@ -1584,6 +1702,10 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 static int run_repl(ds4_engine *engine, cli_config *cfg) {
     repl_chat chat;
     if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
+    if (cfg->kv_load_path && repl_restore_kv(&chat, cfg->kv_load_path) != 0) {
+        repl_chat_free(&chat);
+        return 1;
+    }
 
     struct sigaction old_int;
     struct sigaction sa;
@@ -1685,6 +1807,20 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                     rc = run_chat_turn(engine, cfg, &chat, prompt);
                     free(prompt);
                 }
+            }
+        } else if (!strncmp(cmd, "/save", 5) && (cmd[5] == '\0' || isspace((unsigned char)cmd[5]))) {
+            char *path = trim_inplace(cmd + 5);
+            if (!path[0]) {
+                fprintf(stderr, "ds4: /save needs a file path\n");
+            } else {
+                cli_kv_save_file(chat.session, path);
+            }
+        } else if (!strncmp(cmd, "/load", 5) && (cmd[5] == '\0' || isspace((unsigned char)cmd[5]))) {
+            char *path = trim_inplace(cmd + 5);
+            if (!path[0]) {
+                fprintf(stderr, "ds4: /load needs a file path\n");
+            } else {
+                repl_restore_kv(&chat, path);
             }
         } else if (cmd[0] == '/') {
             fprintf(stderr, "ds4: unknown command: %s\n", cmd);
@@ -1831,6 +1967,10 @@ static cli_config parse_options(int argc, char **argv) {
             }
             c.prompt_owned = read_prompt_file(need_arg(&i, argc, argv, arg), true);
             c.gen.prompt = c.prompt_owned;
+        } else if (!strcmp(arg, "--kv-load")) {
+            c.kv_load_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kv-save")) {
+            c.kv_save_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
