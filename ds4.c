@@ -49158,10 +49158,12 @@ static bool glm_layer_payload_tensor_bytes(uint32_t layer,
         value_dim != DS4_N_VALUE_MLA)
         return false;
 
-    const bool has_indexer = glm_graph_layer_uses_full_indexer(layer);
-    const uint32_t expected_index_live =
-        compact_live != 0 && has_indexer ? compact_live : 0;
-    if (index_live != expected_index_live) return false;
+    /* Indexer rows are data-driven, not predicate-driven: a distributed
+     * layer slice promotes its selection-reuse boundary layer to a full
+     * indexer layer on the box that owns it, so the local predicate cannot
+     * predict a remote shard's layout. A layer either carries no indexer
+     * rows or exactly the live compact rows. */
+    if (index_live != 0 && index_live != compact_live) return false;
 
     uint64_t bytes = 0;
     if (!payload_u64_add_tensor_bytes(&bytes, full_live,
@@ -49173,7 +49175,7 @@ static bool glm_layer_payload_tensor_bytes(uint32_t layer,
         if (!payload_u64_add_tensor_bytes(&bytes, compact_live, DS4_N_KV_LORA) ||
             !payload_u64_add_tensor_bytes(&bytes, compact_live, DS4_N_ROT))
             return false;
-        if (has_indexer &&
+        if (index_live != 0 &&
             !payload_u64_add_tensor_bytes(&bytes, index_live, DS4_N_INDEXER_HEAD_DIM))
             return false;
     }
