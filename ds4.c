@@ -35139,6 +35139,10 @@ static void glm_debug_dump_hidden_layer(const ds4_gpu_tensor *t,
                                         uint32_t pos) {
     const char *path = getenv("DS4_GLM_HIDDEN_DUMP");
     if (!path || !path[0] || !t) return;
+    /* Optional absolute-position filter so LAYER=all stays tractable on
+     * long prompts (one file per layer instead of one per row). */
+    const char *pos_env = getenv("DS4_GLM_HIDDEN_DUMP_POS");
+    if (pos_env && pos_env[0] && (uint32_t)strtoul(pos_env, NULL, 10) != pos) return;
     char full[1024];
     snprintf(full, sizeof(full), "%s.L%02u.T%02u", path, il, pos);
     float *buf = malloc((size_t)DS4_N_EMBD * sizeof(float));
@@ -38606,6 +38610,13 @@ static uint32_t glm_graph_indexed_prefill_chunk_tokens(
         uint32_t compact_cap) {
     (void)full_attention_cap;
     uint32_t chunk = DS4_GLM_METAL_INDEXED_PREFILL_CHUNK_TOKENS;
+    /* Debug override: decouple chunk-boundary mechanics from the indexer
+     * top-k threshold in prefill experiments. Must match on all ranks. */
+    const char *env = getenv("DS4_GLM_INDEXED_PREFILL_CHUNK_TOKENS");
+    if (env && env[0]) {
+        const long v = strtol(env, NULL, 10);
+        if (v > 0 && v <= (long)UINT32_MAX) chunk = (uint32_t)v;
+    }
     if (compact_cap > 0 && chunk > compact_cap) chunk = compact_cap;
     if (chunk == 0) chunk = 1;
     return chunk;
@@ -40436,20 +40447,15 @@ static int glm_graph_routed_moe_batch_dispatch(
          * owned-partial-aware batch path (the per-pair fallback would
          * double-count the split experts and is refused downstream).
          *
-         * EXPERIMENTAL under TP: the big-gate transports are only
-         * validated for payloads within one bulk window (~2 MB); the
-         * multi-window regime (real prefill chunks) corrupts over RDMA
-         * and stalls over TCP.  Until that is fixed, large-batch TP
-         * prefill requires the explicit opt-in below - without it the
-         * dispatch refuses LOUDLY (prompts small enough for the token
-         * prefill path are unaffected and remain exact). */
+         * The historical multi-chunk corruption was the batch attention
+         * head split poisoning the indexer top-k selection (the split is
+         * now gated to causal-regime chunks); transports were exonerated.
+         * DS4_GLM_TP_NO_BATCH_PREFILL remains as an escape hatch. */
         if (g->tp_world == 2 && n_tokens > 64u &&
-            getenv("DS4_GLM_TP_BATCH_PREFILL_EXPERIMENTAL") == NULL) {
+            getenv("DS4_GLM_TP_NO_BATCH_PREFILL") != NULL) {
             fprintf(stderr,
-                    "ds4: GLM TP batch prefill refused: big-gate transport "
-                    "is unvalidated at this payload size (corrupts on rdma, "
-                    "stalls on tcp); set "
-                    "DS4_GLM_TP_BATCH_PREFILL_EXPERIMENTAL=1 to bypass\n");
+                    "ds4: GLM TP batch prefill disabled by "
+                    "DS4_GLM_TP_NO_BATCH_PREFILL\n");
             return 0;
         }
         if (n_tokens >= (g->tp_world == 2 ? 1u :
@@ -44721,6 +44727,13 @@ static bool glm_graph_forward_indexed_tokens(
         g->tp_world == 2 &&
         use_batch_attn_kernel &&
         use_split_value_proj &&
+        use_causal_range_select && /* The indexer score path consumes
+                          * all-head state (same constraint that blocked
+                          * decode q_b ranging); a head-split rank feeds it
+                          * zeroed unowned heads and poisons the top-k
+                          * selection — the multi-chunk corruption root
+                          * cause. Chunks in the causal-range regime never
+                          * read scores and keep the split. */
         (DS4_N_HEAD % 16u) == 0u &&
         n_tokens >= glm_tp_head_split_min(); /* small batches replicate;
                           * the floor is env-tunable for correctness
