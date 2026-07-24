@@ -93,12 +93,27 @@ int ds4_gpu_selected_readback_event_supported(void);
  * cache_f16 contract (store + every reader). Consulted once at runtime by
  * the shared graph to pick the cache element type off-Apple. */
 int ds4_gpu_glm_compact_cache_f16_supported(void);
+/* Nonzero when the backend can store/read the packed fp8 compact-cache row
+ * format (format 2). */
+int ds4_gpu_glm_compact_cache_fp8_supported(void);
 /* Eagerly allocate the streamed-expert pool to its full budget (no-op when
  * already full, streaming off, or the backend has no pool). */
 void ds4_gpu_stream_expert_pool_pregrow(uint32_t n_total_expert,
                                         uint32_t layer,
                                         uint64_t gate_expert_bytes,
                                         uint64_t down_expert_bytes);
+/* GLM compact-cache row format (0=f32, 1=f16, 2=packed fp8): the shared
+ * graph resolves it once and mirrors it to the backend. */
+void ds4_gpu_set_glm_compact_cache_format(uint32_t fmt);
+/* Batch-prefill fp8 adapter: unpack rows [0, rows) of the packed caches
+ * into backend-owned f16 stage tensors (views returned via out params). */
+int ds4_gpu_glm_compact_fp8_stage_unpack(const ds4_gpu_tensor *kv_lora_cache,
+                                         const ds4_gpu_tensor *k_rope_cache,
+                                         uint32_t rows,
+                                         uint32_t kv_lora_dim,
+                                         uint32_t qk_rope,
+                                         ds4_gpu_tensor **lora_out,
+                                         ds4_gpu_tensor **rope_out);
 int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              uint64_t offset,
                                              void *data,

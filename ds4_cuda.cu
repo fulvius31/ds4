@@ -129,6 +129,34 @@ static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
 static int g_glm_model_mode;
 
+/* GLM compact-cache row format, mirrored from the shared graph's runtime
+ * decision (0 = f32, 1 = f16, 2 = packed FP8). Format 2 packs each row as
+ * elems x e4m3 followed by one f32 absmax/448 scale, padded to an 8-byte
+ * stride (512 -> 520 B, 64 -> 72 B). */
+#include <cuda_fp8.h>
+static uint32_t g_glm_cache_format;
+
+extern "C" void ds4_gpu_set_glm_compact_cache_format(uint32_t fmt) {
+    g_glm_cache_format = fmt;
+}
+
+__host__ __device__ __forceinline__ static uint64_t glm_fp8_row_stride(
+        uint32_t elems) {
+    return ((uint64_t)elems + 4u + 7u) & ~7ull;
+}
+
+__device__ __forceinline__ static float glm_fp8_dec(uint8_t v, float scale) {
+    __nv_fp8_e4m3 f;
+    *(uint8_t *)&f = v;
+    return (float)f * scale;
+}
+
+__device__ __forceinline__ static uint8_t glm_fp8_enc(float x,
+                                                      float inv_scale) {
+    const __nv_fp8_e4m3 f = __nv_fp8_e4m3(x * inv_scale);
+    return *(const uint8_t *)&f;
+}
+
 typedef struct {
     int valid;
     int logical_tier;
@@ -24775,6 +24803,65 @@ __global__ static void glm_attention_decode_gather_kernel(
     }
 }
 
+/* FP8 twin of the gather: dequantizes packed rows (values + per-row scale)
+ * into the same f32 scratch, rope pre-rotated with the true row id, so the
+ * PREGATHERED f32 kernels stay the only attention consumers under fp8. */
+__global__ static void glm_attention_decode_gather_fp8_kernel(
+        float *lora_out,
+        float *rope_out,
+        const char *kv_lora_cache,
+        const char *k_rope_cache,
+        const uint32_t *selected,
+        uint32_t n_selected,
+        uint32_t cache_cap,
+        uint32_t kv_lora_dim,
+        uint32_t qk_rope,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    const uint32_t s = blockIdx.x;
+    if (s >= n_selected) return;
+    const uint32_t row = selected[s];
+    if (row >= cache_cap) return;
+    const uint32_t tid = threadIdx.x;
+    float corr_dims[2] = {0.0f, 0.0f};
+    if (ext_factor != 0.0f) {
+        corr_dims[0] = fmaxf(0.0f,
+            floorf(glm_rope_yarn_corr_factor_dev((int)qk_rope,
+                    (int)n_ctx_orig, beta_fast, freq_base)));
+        corr_dims[1] = fminf((float)qk_rope - 1.0f,
+            ceilf(glm_rope_yarn_corr_factor_dev((int)qk_rope,
+                    (int)n_ctx_orig, beta_slow, freq_base)));
+    }
+    const char *lrow = kv_lora_cache +
+        (uint64_t)row * glm_fp8_row_stride(kv_lora_dim);
+    const float lscale = *(const float *)(lrow + kv_lora_dim);
+    const uint64_t lora_dst = (uint64_t)s * kv_lora_dim;
+    for (uint32_t j = tid; j < kv_lora_dim; j += blockDim.x) {
+        lora_out[lora_dst + j] = glm_fp8_dec(((const uint8_t *)lrow)[j], lscale);
+    }
+    const char *rrow = k_rope_cache +
+        (uint64_t)row * glm_fp8_row_stride(qk_rope);
+    const float rscale = *(const float *)(rrow + qk_rope);
+    const uint64_t rope_dst = (uint64_t)s * qk_rope;
+    const float theta_base = (float)row;
+    const float inv_ndims = -1.0f / (float)qk_rope;
+    for (uint32_t r = tid * 2u; r < qk_rope; r += blockDim.x * 2u) {
+        const float theta = theta_base * powf(freq_base, inv_ndims * (float)r);
+        float ct, st;
+        glm_rope_yarn_dev(theta, freq_scale, corr_dims, (int)r,
+                          ext_factor, attn_factor, &ct, &st);
+        const float x0 = glm_fp8_dec(((const uint8_t *)rrow)[r], rscale);
+        const float x1 = glm_fp8_dec(((const uint8_t *)rrow)[r + 1u], rscale);
+        rope_out[rope_dst + r] = x0 * ct - x1 * st;
+        rope_out[rope_dst + r + 1u] = x0 * st + x1 * ct;
+    }
+}
+
 /* Exact staged decode attention. The original fused kernel owns one block per
  * head, which leaves more than half of an L40S idle. These stages preserve the
  * fused kernel's arithmetic order for every score, softmax lane, lora output,
@@ -25207,11 +25294,17 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         return 0;
     }
     const uint64_t cache_elem = cache_f16 ? 2u : 4u;
+    const uint64_t lora_cache_min = g_glm_cache_format == 2u ?
+        (uint64_t)cache_cap * glm_fp8_row_stride(kv_lora_dim) :
+        (uint64_t)cache_cap * kv_lora_dim * cache_elem;
+    const uint64_t rope_cache_min = g_glm_cache_format == 2u ?
+        (uint64_t)cache_cap * glm_fp8_row_stride(qk_rope) :
+        (uint64_t)cache_cap * qk_rope * cache_elem;
     if (heads->bytes < (uint64_t)n_head * value_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_head * qk_dim * sizeof(float) ||
         qk_low->bytes < (uint64_t)n_head * kv_lora_dim * sizeof(float) ||
-        kv_lora_cache->bytes < (uint64_t)cache_cap * kv_lora_dim * cache_elem ||
-        k_rope_cache->bytes < (uint64_t)cache_cap * qk_rope * cache_elem ||
+        kv_lora_cache->bytes < lora_cache_min ||
+        k_rope_cache->bytes < rope_cache_min ||
         selected->bytes < (uint64_t)n_selected * sizeof(uint32_t)) {
         return 0;
     }
@@ -25229,6 +25322,12 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         q->bytes >= 2u * (uint64_t)n_head * qk_dim * sizeof(float) &&
         qk_low->bytes >=
             2u * (uint64_t)n_head * kv_lora_dim * sizeof(float);
+    if (g_glm_cache_format == 2u && range_tok2) {
+        fprintf(stderr,
+                "ds4: fp8 compact cache does not support the tok2 verify "
+                "path (disable --glm-mtp or the fp8 cache)\n");
+        return 0;
+    }
     if (range_tok2 && n_selected < 512u) {
         const bool lora_vec2 =
             getenv("DS4_GLM_ATTN_NO_LORA_VEC2") == NULL;
@@ -25268,8 +25367,9 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         return cuda_ok(cudaGetLastError(),
                        "glm indexed decode attention tok2 range");
     }
-    if (n_selected >= 512u &&
-        getenv("DS4_GLM_ATTN_NO_STAGED_DECODE") == NULL) {
+    if (g_glm_cache_format == 2u ||
+        (n_selected >= 512u &&
+         getenv("DS4_GLM_ATTN_NO_STAGED_DECODE") == NULL)) {
         const uint32_t token_count = range_tok2 ? 2u : 1u;
         const uint32_t score_stride = n_selected + (range_tok2 ? 1u : 0u);
         const uint64_t head_count = (uint64_t)token_count * n_head;
@@ -25284,8 +25384,18 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
                 UINT64_MAX / sizeof(float)) {
             return 0;
         }
-        const int gather_rows = !range_tok2 && n_selected >= 1024u &&
-                                getenv("DS4_GLM_NO_ATTN_GATHER") == NULL;
+        if (g_glm_cache_format == 2u && range_tok2) {
+            fprintf(stderr,
+                    "ds4: fp8 compact cache does not support the tok2 verify "
+                    "path (disable --glm-mtp or the fp8 cache)\n");
+            return 0;
+        }
+        /* Under fp8 the gather is mandatory at every n_selected: it is the
+         * only reader that understands packed rows, and it hands the
+         * pregathered f32 kernels exactly what they expect. */
+        const int gather_rows = g_glm_cache_format == 2u ||
+                                (!range_tok2 && n_selected >= 1024u &&
+                                 getenv("DS4_GLM_NO_ATTN_GATHER") == NULL);
         const uint64_t gather_count = gather_rows ?
             (uint64_t)n_selected * (kv_lora_dim + qk_rope) : 0u;
         const uint64_t scratch_bytes =
@@ -25300,7 +25410,17 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         float *gathered = lora_sum + lora_count;
         float *gathered_rope = gathered + (uint64_t)n_selected * kv_lora_dim;
         if (gather_rows) {
-            if (cache_f16) {
+            if (g_glm_cache_format == 2u) {
+                glm_attention_decode_gather_fp8_kernel
+                        <<<n_selected, 128>>>(
+                        gathered, gathered_rope,
+                        (const char *)kv_lora_cache->ptr,
+                        (const char *)k_rope_cache->ptr,
+                        (const uint32_t *)selected->ptr,
+                        n_selected, cache_cap, kv_lora_dim, qk_rope,
+                        n_ctx_orig, freq_base, freq_scale, ext_factor,
+                        attn_factor, beta_fast, beta_slow);
+            } else if (cache_f16) {
                 glm_attention_decode_gather_kernel<__half>
                         <<<n_selected, 128>>>(
                         gathered, gathered_rope,
@@ -26195,6 +26315,11 @@ extern "C" int ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(
         uint32_t              qk_rope,
         bool                  cache_f16,
         float                 eps) {
+    if (g_glm_cache_format == 2u) {
+        fprintf(stderr, "ds4: fused qkv-norm store does not support the packed "
+                "fp8 cache (decode must take the separate store path)\n");
+        return 0;
+    }
     if (!q_out || !q || !kv_lora_cache || !k_rope_cache || !kv_raw ||
         !model_map || n_tokens == 0 || q_n == 0 || kv_lora_dim == 0 ||
         qk_rope == 0 || kv_raw_dim < kv_lora_dim + qk_rope ||
@@ -27996,6 +28121,55 @@ __global__ static void glm_store_compact_kv_kernel(
     }
 }
 
+/* FP8 twin of glm_store_compact_kv_kernel: same plane layout, plus a
+ * per-row absmax reduction to derive the e4m3 scale. */
+__global__ static void glm_store_compact_kv_fp8_kernel(
+        char *kv_lora_cache,
+        char *k_rope_cache,
+        const float *kv_norm,
+        const float *kv_raw,
+        uint32_t pos0,
+        uint32_t n_tokens,
+        uint32_t cache_cap,
+        uint32_t kv_raw_dim,
+        uint32_t kv_lora_dim,
+        uint32_t qk_rope) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t part = blockIdx.y;
+    if (token >= n_tokens || part > 1u) return;
+    const uint32_t pos = pos0 + token;
+    if (pos >= cache_cap) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    const float *src;
+    char *dst;
+    uint32_t elems;
+    if (part == 0u) {
+        src = kv_norm + (uint64_t)token * kv_lora_dim;
+        elems = kv_lora_dim;
+        dst = kv_lora_cache + (uint64_t)pos * glm_fp8_row_stride(kv_lora_dim);
+    } else {
+        src = kv_raw + (uint64_t)token * kv_raw_dim + kv_lora_dim;
+        elems = qk_rope;
+        dst = k_rope_cache + (uint64_t)pos * glm_fp8_row_stride(qk_rope);
+    }
+    __shared__ float red[128];
+    float amax = 0.0f;
+    for (uint32_t i = tid; i < elems; i += nth) amax = fmaxf(amax, fabsf(src[i]));
+    red[tid] = amax;
+    __syncthreads();
+    for (uint32_t step = nth >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] = fmaxf(red[tid], red[tid + step]);
+        __syncthreads();
+    }
+    const float rowmax = red[0];
+    const float scale = rowmax > 0.0f ? rowmax / 448.0f : 1.0f;
+    const float inv = rowmax > 0.0f ? 448.0f / rowmax : 0.0f;
+    if (tid == 0u) *(float *)(dst + elems) = scale;
+    for (uint32_t i = tid; i < elems; i += nth)
+        ((uint8_t *)dst)[i] = glm_fp8_enc(src[i], inv);
+}
+
 extern "C" int ds4_gpu_glm_store_compact_kv_tensor(
         ds4_gpu_tensor       *kv_lora_cache,
         ds4_gpu_tensor       *k_rope_cache,
@@ -28014,13 +28188,36 @@ extern "C" int ds4_gpu_glm_store_compact_kv_tensor(
         return 0;
     }
     const uint64_t es = cache_f16 ? sizeof(__half) : sizeof(float);
+    const uint64_t lora_min = g_glm_cache_format == 2u ?
+        (uint64_t)cache_cap * glm_fp8_row_stride(kv_lora_dim) :
+        (uint64_t)cache_cap * kv_lora_dim * es;
+    const uint64_t rope_min = g_glm_cache_format == 2u ?
+        (uint64_t)cache_cap * glm_fp8_row_stride(qk_rope) :
+        (uint64_t)cache_cap * qk_rope * es;
     if (kv_norm->bytes < (uint64_t)n_tokens * kv_lora_dim * sizeof(float) ||
         kv_raw->bytes < (uint64_t)n_tokens * kv_raw_dim * sizeof(float) ||
-        kv_lora_cache->bytes < (uint64_t)cache_cap * kv_lora_dim * es ||
-        k_rope_cache->bytes < (uint64_t)cache_cap * qk_rope * es) {
+        kv_lora_cache->bytes < lora_min ||
+        k_rope_cache->bytes < rope_min) {
         return 0;
     }
     dim3 grid(n_tokens, 2, 1);
+    if (g_glm_cache_format == 2u) {
+        if (kv_lora_cache->bytes <
+                (uint64_t)cache_cap * glm_fp8_row_stride(kv_lora_dim) ||
+            k_rope_cache->bytes <
+                (uint64_t)cache_cap * glm_fp8_row_stride(qk_rope)) {
+            fprintf(stderr,
+                    "ds4: CUDA fp8 compact store: cache too small for packed rows\n");
+            return 0;
+        }
+        glm_store_compact_kv_fp8_kernel<<<grid, 128>>>(
+                (char *)kv_lora_cache->ptr,
+                (char *)k_rope_cache->ptr,
+                (const float *)kv_norm->ptr,
+                (const float *)kv_raw->ptr,
+                pos0, n_tokens, cache_cap, kv_raw_dim, kv_lora_dim, qk_rope);
+        return cuda_ok(cudaGetLastError(), "glm store compact kv fp8 launch");
+    }
     glm_store_compact_kv_kernel<<<grid, 128>>>(
             (char *)kv_lora_cache->ptr,
             (char *)k_rope_cache->ptr,
@@ -28029,6 +28226,103 @@ extern "C" int ds4_gpu_glm_store_compact_kv_tensor(
             pos0, n_tokens, cache_cap, kv_raw_dim, kv_lora_dim, qk_rope,
             cache_f16 ? 1u : 0u);
     return cuda_ok(cudaGetLastError(), "glm store compact kv launch");
+}
+
+/* Batch-prefill fp8 adapter: unpack rows [0, rows) of both packed caches
+ * into persistent f16 stage buffers and hand back tensor views, so the
+ * batch attention kernels run unmodified with cache_f16=true. */
+__global__ static void glm_compact_unpack_fp8_kernel(
+        __half *lora_out,
+        __half *rope_out,
+        const char *kv_lora_cache,
+        const char *k_rope_cache,
+        uint32_t rows,
+        uint32_t kv_lora_dim,
+        uint32_t qk_rope) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t part = blockIdx.y;
+    if (row >= rows || part > 1u) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    if (part == 0u) {
+        const char *src = kv_lora_cache +
+            (uint64_t)row * glm_fp8_row_stride(kv_lora_dim);
+        const float scale = *(const float *)(src + kv_lora_dim);
+        __half *dst = lora_out + (uint64_t)row * kv_lora_dim;
+        for (uint32_t i = tid; i < kv_lora_dim; i += nth)
+            dst[i] = __float2half(glm_fp8_dec(((const uint8_t *)src)[i], scale));
+    } else {
+        const char *src = k_rope_cache +
+            (uint64_t)row * glm_fp8_row_stride(qk_rope);
+        const float scale = *(const float *)(src + qk_rope);
+        __half *dst = rope_out + (uint64_t)row * qk_rope;
+        for (uint32_t i = tid; i < qk_rope; i += nth)
+            dst[i] = __float2half(glm_fp8_dec(((const uint8_t *)src)[i], scale));
+    }
+}
+
+static char *g_fp8_stage_lora_ptr;
+static uint64_t g_fp8_stage_lora_cap;
+static char *g_fp8_stage_rope_ptr;
+static uint64_t g_fp8_stage_rope_cap;
+static ds4_gpu_tensor g_fp8_stage_lora_tensor;
+static ds4_gpu_tensor g_fp8_stage_rope_tensor;
+
+static int glm_fp8_stage_ensure(char **ptr, uint64_t *cap, uint64_t bytes) {
+    if (*cap >= bytes) return 1;
+    if (*ptr) { (void)cudaFree(*ptr); *ptr = NULL; *cap = 0; }
+    if (cudaMalloc((void **)ptr, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr,
+                "ds4: fp8 stage allocation failed (%.1f MiB)\n",
+                (double)bytes / 1048576.0);
+        return 0;
+    }
+    *cap = bytes;
+    return 1;
+}
+
+extern "C" int ds4_gpu_glm_compact_fp8_stage_unpack(
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        uint32_t rows,
+        uint32_t kv_lora_dim,
+        uint32_t qk_rope,
+        ds4_gpu_tensor **lora_out,
+        ds4_gpu_tensor **rope_out) {
+    if (!kv_lora_cache || !k_rope_cache || !lora_out || !rope_out ||
+        rows == 0 || kv_lora_dim == 0 || qk_rope == 0 ||
+        g_glm_cache_format != 2u) {
+        return 0;
+    }
+    if (kv_lora_cache->bytes < (uint64_t)rows * glm_fp8_row_stride(kv_lora_dim) ||
+        k_rope_cache->bytes < (uint64_t)rows * glm_fp8_row_stride(qk_rope)) {
+        fprintf(stderr, "ds4: fp8 stage unpack: cache smaller than rows\n");
+        return 0;
+    }
+    const uint64_t lb = (uint64_t)rows * kv_lora_dim * sizeof(__half);
+    const uint64_t rb = (uint64_t)rows * qk_rope * sizeof(__half);
+    if (!glm_fp8_stage_ensure(&g_fp8_stage_lora_ptr, &g_fp8_stage_lora_cap, lb) ||
+        !glm_fp8_stage_ensure(&g_fp8_stage_rope_ptr, &g_fp8_stage_rope_cap, rb)) {
+        return 0;
+    }
+    dim3 grid(rows, 2, 1);
+    glm_compact_unpack_fp8_kernel<<<grid, 128>>>(
+            (__half *)g_fp8_stage_lora_ptr,
+            (__half *)g_fp8_stage_rope_ptr,
+            (const char *)kv_lora_cache->ptr,
+            (const char *)k_rope_cache->ptr,
+            rows, kv_lora_dim, qk_rope);
+    if (!cuda_ok(cudaGetLastError(), "glm fp8 stage unpack launch")) return 0;
+    memset(&g_fp8_stage_lora_tensor, 0, sizeof(g_fp8_stage_lora_tensor));
+    memset(&g_fp8_stage_rope_tensor, 0, sizeof(g_fp8_stage_rope_tensor));
+    g_fp8_stage_lora_tensor.ptr = g_fp8_stage_lora_ptr;
+    g_fp8_stage_lora_tensor.bytes = lb;
+    g_fp8_stage_rope_tensor.ptr = g_fp8_stage_rope_ptr;
+    g_fp8_stage_rope_tensor.bytes = rb;
+    *lora_out = &g_fp8_stage_lora_tensor;
+    *rope_out = &g_fp8_stage_rope_tensor;
+    return 1;
 }
 
 
@@ -29461,6 +29755,12 @@ extern "C" int ds4_gpu_glm_compact_cache_f16_supported(void) {
     /* Every compact-cache store and reader in this file carries the
      * cache_f16 branch (Metal-contract mirror); the gather kernel is
      * CT-templated with both instantiations dispatched. */
+    return 1;
+}
+
+extern "C" int ds4_gpu_glm_compact_cache_fp8_supported(void) {
+    /* Packed fp8 rows are handled by the store dispatch, the forced decode
+     * gather, and the batch stage unpack in this file. */
     return 1;
 }
 
