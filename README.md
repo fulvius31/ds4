@@ -129,7 +129,9 @@ session documents, not product docs); ask in issues if you want any of them.
 - Prefill staging/compute overlap + grouped GEMM → 60–100 t/s target
 - Packed-row wire format for the TP restore push (ships e4m3 bytes instead
   of f32 planes: ~7× less on the wire for huge fp8 sessions)
-- MTP speculative probe on the resident pipeline config
+- MTP on the pipeline: the probe landed (speculative cycles work end to end
+  behind `--glm-mtp`); making it a *win* needs per-draft routed-expert
+  upload and a fused two-token verify — until then the flag costs speed
 
 ## Credits
 
