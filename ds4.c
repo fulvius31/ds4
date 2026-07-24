@@ -35193,7 +35193,32 @@ static uint32_t glm_graph_compact_cache_is_f16(void) {
 #endif
 }
 
+/* GLM compact-cache row format: 0 = f32, 1 = f16, 2 = packed FP8. Packed
+ * follows the upstream #418 pattern for the DeepSeek comp cache, adapted to
+ * the GLM row (512 kv_lora + 64 rope): e4m3 value planes with one f32 scale
+ * per plane, ~648 B/row vs 1152 at f16 (~1.78x smaller; ~400k ctx at pool
+ * 5000 in the proven envelope). STAGED-BUT-DORMANT: the READY switch stays 0
+ * until every cache site is packed-aware — store (3 call sites), gather +
+ * staged + pregathered decode kernels, the batch attention chain, the
+ * begin_load expert table, alloc sizing and plan prints, and the session
+ * payload serializer (needs an fp8_as_f32 sibling). Activating the env
+ * before that would mis-handle the packed row on unconverted paths, the
+ * exact hazard upstream's gate documents. */
+#define DS4_GLM_COMPACT_CACHE_PACKED_READY 0
+static uint32_t glm_graph_compact_cache_format(void) {
+#if DS4_GLM_COMPACT_CACHE_PACKED_READY
+    if (getenv("DS4_GLM_FP8_KV_STORE") != NULL &&
+        glm_graph_compact_cache_is_f16()) {
+        return 2u;
+    }
+#endif
+    return glm_graph_compact_cache_is_f16() ? 1u : 0u;
+}
+
 static uint64_t glm_graph_compact_cache_elem_bytes(void) {
+    /* Formats 0/1 are element-uniform; format 2 is row-packed and must use
+     * a row-bytes helper instead when the conversion lands. */
+    (void)glm_graph_compact_cache_format;
     return glm_graph_compact_cache_is_f16() ? sizeof(uint16_t) : sizeof(float);
 }
 
