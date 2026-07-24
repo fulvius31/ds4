@@ -1977,6 +1977,93 @@ static int cuda_model_copy_to_device_streamed(
     return 1;
 }
 
+/* Batched gate/up/down miss upload (upstream antirez/ds4#460): stage the
+ * three tensors of one expert through distinct stage slots with a single
+ * trailing stream sync, instead of three sequential streamed copies each
+ * paying its own full sync. Safe because every streamed-copy entry point
+ * fully drains the upload stream before returning, so the stage slots are
+ * always idle on entry. Returns -1 when this expert needs the general
+ * streamed-copy path. */
+static int cuda_model_copy_expert_to_device_streamed(
+        char *const dst[3],
+        const void *model_map,
+        uint64_t model_size,
+        const uint64_t offset[3],
+        const uint64_t bytes[3],
+        const char *const what[3]) {
+    if (g_model_fd < 0 ||
+        (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base)) {
+        return -1;
+    }
+
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    for (uint32_t i = 0; i < 3; i++) {
+        if (!dst[i] || offset[i] > model_size ||
+            bytes[i] == 0 || bytes[i] > model_size - offset[i] ||
+            bytes[i] > chunk) {
+            return -1;
+        }
+    }
+
+    const uint64_t stage_bytes =
+        chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_stream_selected_stage_pool_alloc(stage_bytes)) return 0;
+
+    int enqueued = 0;
+    for (uint32_t i = 0; i < 3; i++) {
+        const char *payload = NULL;
+        if (!cuda_model_stage_read(g_stream_selected_stage[i],
+                                   g_stream_selected_stage_bytes,
+                                   offset[i], bytes[i], &payload)) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming selected read failed for %s: %s\n",
+                    what[i], strerror(errno));
+            if (enqueued) {
+                (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+            }
+            return 0;
+        }
+        cudaError_t err = cudaMemcpyAsync(dst[i], payload, (size_t)bytes[i],
+                                          cudaMemcpyHostToDevice,
+                                          g_stream_selected_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming selected copy failed for %s: %s\n",
+                    what[i], cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            if (enqueued) {
+                (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+            }
+            return 0;
+        }
+        enqueued = 1;
+        err = cudaEventRecord(g_stream_selected_stage_event[i],
+                              g_stream_selected_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming selected staging record failed for %s: %s\n",
+                    what[i], cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+            return 0;
+        }
+        cuda_model_drop_file_pages(offset[i], bytes[i]);
+        cuda_model_discard_source_pages(model_map, model_size,
+                                        offset[i], bytes[i]);
+    }
+
+    const cudaError_t err =
+        cudaStreamSynchronize(g_stream_selected_upload_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA streaming selected expert upload sync failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
 static uint64_t cuda_model_cache_limit_bytes(void) {
     uint64_t gb = 0;
     const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
@@ -23742,18 +23829,32 @@ static int cuda_stream_selected_cache_begin_load(
             char *pd = cuda_expert_pool_ptr(g_expert_pool.down_chunks, slot,
                                             g_expert_pool.down_bytes);
             if (!hit) {
-                if (!cuda_model_copy_to_device_streamed(
-                            pg, table->model_map, table->model_size,
-                            gate_src, table->gate_expert_bytes,
-                            "pool gate expert fill") ||
-                    !cuda_model_copy_to_device_streamed(
-                            pu, table->model_map, table->model_size,
-                            up_src, table->gate_expert_bytes,
-                            "pool up expert fill") ||
-                    !cuda_model_copy_to_device_streamed(
-                            pd, table->model_map, table->model_size,
-                            down_src, table->down_expert_bytes,
-                            "pool down expert fill")) {
+                char *pool_dst[3] = {pg, pu, pd};
+                const uint64_t pool_src[3] = {gate_src, up_src, down_src};
+                const uint64_t pool_bytes[3] = {
+                    table->gate_expert_bytes,
+                    table->gate_expert_bytes,
+                    table->down_expert_bytes
+                };
+                const char *pool_what[3] = {
+                    "pool gate expert fill",
+                    "pool up expert fill",
+                    "pool down expert fill"
+                };
+                const int batched = cuda_model_copy_expert_to_device_streamed(
+                        pool_dst, table->model_map, table->model_size,
+                        pool_src, pool_bytes, pool_what);
+                if (batched == 0 ||
+                    (batched < 0 &&
+                     (!cuda_model_copy_to_device_streamed(
+                              pool_dst[0], table->model_map, table->model_size,
+                              pool_src[0], pool_bytes[0], pool_what[0]) ||
+                      !cuda_model_copy_to_device_streamed(
+                              pool_dst[1], table->model_map, table->model_size,
+                              pool_src[1], pool_bytes[1], pool_what[1]) ||
+                      !cuda_model_copy_to_device_streamed(
+                              pool_dst[2], table->model_map, table->model_size,
+                              pool_src[2], pool_bytes[2], pool_what[2])))) {
                     g_expert_pool.slot_key[slot] = UINT32_MAX;
                     g_expert_pool.key_to_slot.erase(
                             table->layer * 256u + (uint32_t)expert);
@@ -23793,23 +23894,40 @@ static int cuda_stream_selected_cache_begin_load(
             }
             continue;
         }
-        if (!cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.gate_ptr + gate_dst,
-                    table->model_map, table->model_size,
-                    gate_src, table->gate_expert_bytes,
-                    "stream gate expert copy") ||
-            !cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.up_ptr + gate_dst,
-                    table->model_map, table->model_size,
-                    up_src, table->gate_expert_bytes,
-                    "stream up expert copy") ||
-            !cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.down_ptr + down_dst,
-                    table->model_map, table->model_size,
-                    down_src, table->down_expert_bytes,
-                    "stream down expert copy")) {
-            cuda_stream_selected_cache_invalidate();
-            return 0;
+        {
+            char *scratch_dst[3] = {
+                g_stream_selected_cache.gate_ptr + gate_dst,
+                g_stream_selected_cache.up_ptr + gate_dst,
+                g_stream_selected_cache.down_ptr + down_dst
+            };
+            const uint64_t scratch_src[3] = { gate_src, up_src, down_src };
+            const uint64_t scratch_bytes[3] = {
+                table->gate_expert_bytes,
+                table->gate_expert_bytes,
+                table->down_expert_bytes
+            };
+            const char *scratch_what[3] = {
+                "stream gate expert copy",
+                "stream up expert copy",
+                "stream down expert copy"
+            };
+            const int batched = cuda_model_copy_expert_to_device_streamed(
+                    scratch_dst, table->model_map, table->model_size,
+                    scratch_src, scratch_bytes, scratch_what);
+            if (batched == 0 ||
+                (batched < 0 &&
+                 (!cuda_model_copy_to_device_streamed(
+                          scratch_dst[0], table->model_map, table->model_size,
+                          scratch_src[0], scratch_bytes[0], scratch_what[0]) ||
+                  !cuda_model_copy_to_device_streamed(
+                          scratch_dst[1], table->model_map, table->model_size,
+                          scratch_src[1], scratch_bytes[1], scratch_what[1]) ||
+                  !cuda_model_copy_to_device_streamed(
+                          scratch_dst[2], table->model_map, table->model_size,
+                          scratch_src[2], scratch_bytes[2], scratch_what[2])))) {
+                cuda_stream_selected_cache_invalidate();
+                return 0;
+            }
         }
     }
     if (pool_ok && getenv("DS4_CUDA_EXPERT_POOL_STATS") != NULL) {
