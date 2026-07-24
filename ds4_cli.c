@@ -612,6 +612,14 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     const ds4_tokens *sync_target = prompt;
     int restored_tokens = 0;
     if (cfg->kv_load_path) {
+        if (cfg->engine.tp.role == DS4_TP_LEADER) {
+            fprintf(stderr, "ds4: --kv-load is not supported in tensor-parallel mode: "
+                    "the worker's mirrored session cannot be restored and the run "
+                    "would hang at the first TP gate. Restore on a single box or "
+                    "the pipeline coordinator.\n");
+            ds4_session_free(session);
+            return 1;
+        }
         if (cli_kv_load_file(session, cfg->kv_load_path) != 0) {
             ds4_session_free(session);
             return 1;
@@ -1489,7 +1497,14 @@ static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx
     return 0;
 }
 
-static int repl_restore_kv(repl_chat *chat, const char *path) {
+static int repl_restore_kv(repl_chat *chat, const cli_config *cfg, const char *path) {
+    if (cfg->engine.tp.role == DS4_TP_LEADER) {
+        fprintf(stderr, "ds4: --kv-load is not supported in tensor-parallel mode: "
+                "the worker's mirrored session cannot be restored and the run "
+                "would hang at the first TP gate. Restore on a single box or "
+                "the pipeline coordinator.\n");
+        return 1;
+    }
     if (cli_kv_load_file(chat->session, path) != 0) return 1;
     chat->transcript.len = 0;
     const ds4_tokens *saved = ds4_session_tokens(chat->session);
@@ -1702,7 +1717,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 static int run_repl(ds4_engine *engine, cli_config *cfg) {
     repl_chat chat;
     if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
-    if (cfg->kv_load_path && repl_restore_kv(&chat, cfg->kv_load_path) != 0) {
+    if (cfg->kv_load_path && repl_restore_kv(&chat, cfg, cfg->kv_load_path) != 0) {
         repl_chat_free(&chat);
         return 1;
     }
@@ -1820,7 +1835,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             if (!path[0]) {
                 fprintf(stderr, "ds4: /load needs a file path\n");
             } else {
-                repl_restore_kv(&chat, path);
+                repl_restore_kv(&chat, cfg, path);
             }
         } else if (cmd[0] == '/') {
             fprintf(stderr, "ds4: unknown command: %s\n", cmd);
@@ -2215,6 +2230,15 @@ int main(int argc, char **argv) {
     cfg.engine.metal_graph_test = cfg.gen.metal_graph_test;
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
+    if (cfg.kv_load_path && cfg.engine.tp.role == DS4_TP_LEADER) {
+        fprintf(stderr, "ds4: --kv-load is not supported in tensor-parallel mode: "
+                "the worker's mirrored session cannot be restored and the run "
+                "would hang at the first TP gate. Restore on a single box or "
+                "the pipeline coordinator.\n");
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return 1;
+    }
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = {0};
