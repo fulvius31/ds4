@@ -46,7 +46,8 @@ starts (verified through every optimization), and every envelope allocates
 and runs inside the same ~90 GiB planned budget the memory runbook proves
 safe. Decode at 45k went **2.23 → 3.29 t/s (+48%)** across this fork's
 optimization cycles, and fp8 costs none of it: 45k and 190k rates match f16
-to the second decimal.
+to the second decimal, and the perplexity fixture scores a statistical tie
+(8.765 fp8 vs 8.776 f16 over 2,000 scored tokens).
 
 ## Quick start
 
@@ -103,9 +104,11 @@ at 12,288 — its coordinator runs ~1 GiB from the memory ceiling by design.
   `/save` `/load` in the REPL): kill both ranks, relaunch, continue the
   conversation with only new tokens prefilled. Sessions are format-portable:
   an fp8 session restores into an f16 run and vice versa (one universal file
-  format; fp8 requantizes on load, exactly). Tensor-parallel leaders refuse
-  `--kv-load` loudly — the worker's mirrored session cannot be restored yet;
-  restore on a single box or the pipeline coordinator.
+  format; fp8 requantizes on load — quantized codes survive round trips
+  exactly, serialized floats wobble ≤2 ulp from scale re-derivation). On a
+  tensor-parallel leader, restore re-prefills the transcript so the worker's
+  mirrored session stays in lockstep. `-n 0` with `--kv-load`/`--kv-save`
+  is a generation-free pass-through for session surgery.
 - **Reboot-proof RDMA bring-up**: the launch scripts discover the RoCE v2
   GID index at start (reboots and docker network churn shuffle the table).
 - **Server fixes** for GLM thinking mode (unclosed reasoning surfaces as
@@ -122,9 +125,8 @@ session documents, not product docs); ask in issues if you want any of them.
 ## Roadmap
 
 - Prefill staging/compute overlap + grouped GEMM → 60–100 t/s target
-- TP session restore (push the restored cache to the worker, or re-prefill
-  the transcript on load) — today TP `--kv-load` refuses by design
-- fp8 quality fixture beyond needle retrieval, gating any default-on
+- TP restore without re-prefill (push the restored cache to the worker over
+  the control connection)
 - MTP speculative probe on the resident pipeline config
 
 ## Credits

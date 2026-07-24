@@ -612,14 +612,6 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     const ds4_tokens *sync_target = prompt;
     int restored_tokens = 0;
     if (cfg->kv_load_path) {
-        if (cfg->engine.tp.role == DS4_TP_LEADER) {
-            fprintf(stderr, "ds4: --kv-load is not supported in tensor-parallel mode: "
-                    "the worker's mirrored session cannot be restored and the run "
-                    "would hang at the first TP gate. Restore on a single box or "
-                    "the pipeline coordinator.\n");
-            ds4_session_free(session);
-            return 1;
-        }
         if (cli_kv_load_file(session, cfg->kv_load_path) != 0) {
             ds4_session_free(session);
             return 1;
@@ -627,8 +619,20 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         const ds4_tokens *saved = ds4_session_tokens(session);
         if (saved) ds4_tokens_copy(&continuation, saved);
         restored_tokens = continuation.len;
-        ds4_chat_append_message(engine, &continuation, "user", cfg->gen.prompt);
-        ds4_chat_append_assistant_prefix(engine, &continuation, think_mode);
+        if (cfg->engine.tp.role == DS4_TP_LEADER) {
+            /* The worker's mirrored session cannot receive the restored
+             * cache bytes, so rewind (mirrored to the worker) and let the
+             * sync re-prefill the whole transcript on both ranks. */
+            ds4_log(stderr, DS4_LOG_KVCACHE,
+                    "ds4: tensor-parallel restore: re-prefilling %d restored "
+                    "tokens so the worker's mirrored session stays in lockstep\n",
+                    restored_tokens);
+            ds4_session_rewind(session, 0);
+        }
+        if (cfg->gen.prompt) {
+            ds4_chat_append_message(engine, &continuation, "user", cfg->gen.prompt);
+            ds4_chat_append_assistant_prefix(engine, &continuation, think_mode);
+        }
         sync_target = &continuation;
     }
 
@@ -1272,7 +1276,7 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
 
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokens prompt = {0};
-    build_prompt(engine, &cfg->gen, &prompt);
+    if (cfg->gen.prompt) build_prompt(engine, &cfg->gen, &prompt);
 
     int rc = 0;
     if (cfg->gen.metal_graph_test) {
@@ -1498,14 +1502,15 @@ static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx
 }
 
 static int repl_restore_kv(repl_chat *chat, const cli_config *cfg, const char *path) {
-    if (cfg->engine.tp.role == DS4_TP_LEADER) {
-        fprintf(stderr, "ds4: --kv-load is not supported in tensor-parallel mode: "
-                "the worker's mirrored session cannot be restored and the run "
-                "would hang at the first TP gate. Restore on a single box or "
-                "the pipeline coordinator.\n");
-        return 1;
-    }
     if (cli_kv_load_file(chat->session, path) != 0) return 1;
+    if (cfg->engine.tp.role == DS4_TP_LEADER) {
+        /* Mirrored-session restore: rewind (sent to the worker too) and let
+         * the next sync re-prefill the transcript on both ranks. */
+        ds4_log(stderr, DS4_LOG_KVCACHE,
+                "ds4: tensor-parallel restore: the restored transcript will "
+                "re-prefill so the worker's mirrored session stays in lockstep\n");
+        ds4_session_rewind(chat->session, 0);
+    }
     chat->transcript.len = 0;
     const ds4_tokens *saved = ds4_session_tokens(chat->session);
     if (saved) tokens_insert(&chat->transcript, 0, saved);
@@ -2014,7 +2019,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
-            c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
+            /* 0 is allowed: with --kv-load it makes a generation-free
+             * pass-through (restore, then --kv-save re-serializes). */
+            c.gen.n_predict = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.gen.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--temp")) {
@@ -2230,15 +2237,6 @@ int main(int argc, char **argv) {
     cfg.engine.metal_graph_test = cfg.gen.metal_graph_test;
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
-    if (cfg.kv_load_path && cfg.engine.tp.role == DS4_TP_LEADER) {
-        fprintf(stderr, "ds4: --kv-load is not supported in tensor-parallel mode: "
-                "the worker's mirrored session cannot be restored and the run "
-                "would hang at the first TP gate. Restore on a single box or "
-                "the pipeline coordinator.\n");
-        ds4_dist_options_free(cfg.dist);
-        free(cfg.prompt_owned);
-        return 1;
-    }
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = {0};
@@ -2355,9 +2353,12 @@ int main(int argc, char **argv) {
                                         cfg.gen.imatrix_max_tokens);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
-    } else if (cfg.gen.prompt == NULL) {
+    } else if (cfg.gen.prompt == NULL &&
+               !(cfg.kv_load_path && cfg.gen.n_predict == 0)) {
         rc = run_repl(engine, &cfg);
     } else {
+        /* Promptless --kv-load -n 0 is the one-shot pass-through: restore
+         * the session, generate nothing, honor --kv-save. */
         rc = run_generation(engine, &cfg);
     }
     if (tp_leader) ds4_tp_send_stop(tp_leader);
