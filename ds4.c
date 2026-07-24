@@ -34571,28 +34571,20 @@ static uint32_t glm_graph_compact_cache_is_f16(void) {
 #endif
 }
 
-/* GLM compact-cache row format: 0 = f32, 1 = f16, 2 = packed FP8. Packed
- * follows the upstream #418 pattern for the DeepSeek comp cache, adapted to
- * the GLM row (512 kv_lora + 64 rope): e4m3 value planes with one f32 scale
- * per plane, ~648 B/row vs 1152 at f16 (~1.78x smaller; ~400k ctx at pool
- * 5000 in the proven envelope). STAGED-BUT-DORMANT: the READY switch stays 0
- * until every cache site is packed-aware — store (3 call sites), gather +
- * staged + pregathered decode kernels, the batch attention chain, the
- * begin_load expert table, alloc sizing and plan prints, and the session
- * payload serializer (needs an fp8_as_f32 sibling). Activating the env
- * before that would mis-handle the packed row on unconverted paths, the
- * exact hazard upstream's gate documents. */
-#define DS4_GLM_COMPACT_CACHE_PACKED_READY 1
+/* GLM compact-cache row format: 0 = f32, 1 = f16, 2 = packed FP8 (opt-in,
+ * DS4_GLM_FP8_KV_STORE=1, backend-gated). Packed follows the upstream #418
+ * pattern for the DeepSeek comp cache, adapted to the GLM row (512 kv_lora
+ * + 64 rope): e4m3 values with one f32 absmax/448 scale per row, ~592 B vs
+ * 1152 at f16 (~400k ctx at pool 5000 in the proven envelope). */
 
 /* Packed fp8 row: elems × e4m3 + one f32 per-row scale, padded to an
  * 8-byte stride (512 → 520 B, 64 → 72 B). Must match glm_fp8_row_stride
  * in the CUDA backend. */
-static DS4_MAYBE_UNUSED uint64_t glm_graph_compact_packed_row_bytes(uint64_t elems) {
+static uint64_t glm_graph_compact_packed_row_bytes(uint64_t elems) {
     return (elems + 4u + 7u) & ~(uint64_t)7u;
 }
 
 static uint32_t glm_graph_compact_cache_format(void) {
-#if DS4_GLM_COMPACT_CACHE_PACKED_READY
     static int fmt_cached = -1;
     if (fmt_cached < 0) {
         uint32_t fmt = glm_graph_compact_cache_is_f16() ? 1u : 0u;
@@ -34610,15 +34602,11 @@ static uint32_t glm_graph_compact_cache_format(void) {
         fmt_cached = (int)fmt;
     }
     return (uint32_t)fmt_cached;
-#else
-    return glm_graph_compact_cache_is_f16() ? 1u : 0u;
-#endif
 }
 
 static uint64_t glm_graph_compact_cache_elem_bytes(void) {
-    /* Formats 0/1 are element-uniform; format 2 is row-packed and must use
-     * a row-bytes helper instead when the conversion lands. */
-    (void)glm_graph_compact_cache_format;
+    /* Formats 0/1 are element-uniform; packed fp8 rows size via
+     * glm_graph_compact_packed_row_bytes instead. */
     return glm_graph_compact_cache_is_f16() ? sizeof(uint16_t) : sizeof(float);
 }
 
@@ -34847,11 +34835,14 @@ static uint64_t glm_graph_compact_cache_bytes_for_cap(
         uint32_t compact_cap) {
     if (compact_cap == 0) return 0;
     const uint64_t elem = glm_graph_compact_cache_elem_bytes();
+    const uint64_t kv_row_bytes = glm_graph_compact_cache_format() == 2u ?
+        glm_graph_compact_packed_row_bytes(DS4_N_KV_LORA) +
+            glm_graph_compact_packed_row_bytes(DS4_N_ROT) :
+        ((uint64_t)DS4_N_KV_LORA + DS4_N_ROT) * elem;
     uint64_t total =
         (uint64_t)normal_layers *
         compact_cap *
-        ((uint64_t)DS4_N_KV_LORA + DS4_N_ROT) *
-        elem;
+        kv_row_bytes;
     total +=
         (uint64_t)indexer_layers *
         compact_cap *
@@ -48808,13 +48799,161 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
     return 0;
 }
 
-static int payload_write_glm_compact_span(FILE *fp, const ds4_gpu_tensor *tensor,
-                                          uint64_t count, uint8_t *buf, size_t cap,
-                                          char *err, size_t errlen) {
-    if (glm_graph_compact_cache_format() == 2u) {
-        payload_set_err(err, errlen, "session save requires the f16/f32 compact "
-                        "cache (packed fp8 rows are not serializable yet)");
+/* Exact e4m3 (OCP FN: bias 7, no inf, S.1111.111 = NaN, max ±448) decode;
+ * every grid value is exactly representable in f32. */
+static float glm_fp8_e4m3_decode(uint8_t v) {
+    const uint32_t exp = (v >> 3) & 0xFu;
+    const uint32_t man = v & 0x7u;
+    float out;
+    if (exp == 0xFu && man == 0x7u) out = NAN;
+    else if (exp == 0u) out = ldexpf((float)man, -9);
+    else out = ldexpf(1.0f + (float)man * 0.125f, (int)exp - 7);
+    return (v & 0x80u) ? -out : out;
+}
+
+/* Nearest-code encoder over the sorted positive half-grid (ties to the even
+ * code, which is round-to-nearest-even on this grid; magnitudes above 448
+ * saturate like the CUDA satfinite convert). Exact grid inputs return their
+ * own code, the property the packed session round trip relies on. */
+static uint8_t glm_fp8_e4m3_encode(float x) {
+    static float pos[127];
+    static int pos_init;
+    if (!pos_init) {
+        for (int i = 0; i < 127; i++) pos[i] = glm_fp8_e4m3_decode((uint8_t)i);
+        pos_init = 1;
+    }
+    if (isnan(x)) return 0x7Fu;
+    const uint8_t sign = signbit(x) ? 0x80u : 0u;
+    const float ax = fabsf(x);
+    if (ax >= pos[126]) return (uint8_t)(sign | 0x7Eu);
+    uint32_t lo = 0, hi = 126;
+    while (lo + 1u < hi) {
+        const uint32_t mid = (lo + hi) >> 1;
+        if (pos[mid] <= ax) lo = mid; else hi = mid;
+    }
+    const float dlo = ax - pos[lo];
+    const float dhi = pos[hi] - ax;
+    uint32_t code = lo;
+    if (dhi < dlo) code = hi;
+    else if (dhi == dlo && (lo & 1u) != 0u) code = hi;
+    return (uint8_t)(sign | code);
+}
+
+/* Save packed fp8 rows as the universal f32-plane session format: dequant
+ * (value × per-row scale) and widen. Sessions stay cross-format restorable. */
+static int payload_write_packed_fp8_span_as_f32(FILE *fp, const ds4_gpu_tensor *tensor,
+                                                uint64_t count, uint32_t row_elems,
+                                                uint8_t *buf, size_t cap,
+                                                char *err, size_t errlen) {
+    const uint64_t stride = glm_graph_compact_packed_row_bytes(row_elems);
+    const uint64_t row_out = (uint64_t)row_elems * sizeof(float);
+    if (!tensor || row_elems == 0u || count % row_elems != 0u ||
+        count > UINT64_MAX / sizeof(float)) {
+        payload_set_err(err, errlen, "packed fp8 span has a bad element count");
         return 1;
+    }
+    const uint64_t rows = count / row_elems;
+    if (rows > ds4_gpu_tensor_bytes(tensor) / stride) {
+        payload_set_err(err, errlen, "session tensor is smaller than the packed fp8 payload");
+        return 1;
+    }
+    const size_t rows_per = cap / (size_t)(stride + row_out);
+    if (rows_per == 0) {
+        payload_set_err(err, errlen, "session tensor conversion buffer is too small");
+        return 1;
+    }
+    uint8_t *pk = buf;
+    float *f = (float *)(void *)(buf + rows_per * stride);
+    uint64_t done = 0;
+    while (done < rows) {
+        const size_t n = rows - done > (uint64_t)rows_per
+            ? rows_per
+            : (size_t)(rows - done);
+        if (ds4_gpu_tensor_read(tensor, done * stride, pk, (uint64_t)n * stride) == 0) {
+            payload_set_err(err, errlen, "failed to read packed fp8 session tensor");
+            return 1;
+        }
+        for (size_t r = 0; r < n; r++) {
+            const uint8_t *src = pk + r * stride;
+            float scale;
+            memcpy(&scale, src + row_elems, sizeof(float));
+            float *dst = f + r * row_elems;
+            for (uint32_t i = 0; i < row_elems; i++)
+                dst[i] = glm_fp8_e4m3_decode(src[i]) * scale;
+        }
+        if (payload_write_bytes(fp, f, (uint64_t)n * row_out, err, errlen) != 0) return 1;
+        done += n;
+    }
+    return 0;
+}
+
+/* Restore f32 planes into packed fp8 rows: per-row absmax/448 requant with
+ * the same scale formula as the CUDA store kernel. Values written by the
+ * packed save land back on their own grid points, so save→restore→save is
+ * code-exact. */
+static int payload_read_f32_span_as_packed_fp8(FILE *fp, ds4_gpu_tensor *tensor,
+                                               uint64_t count, uint32_t row_elems,
+                                               uint8_t *buf, size_t cap,
+                                               uint64_t *remaining,
+                                               char *err, size_t errlen) {
+    const uint64_t stride = glm_graph_compact_packed_row_bytes(row_elems);
+    const uint64_t row_in = (uint64_t)row_elems * sizeof(float);
+    if (!tensor || row_elems == 0u || count % row_elems != 0u ||
+        count > UINT64_MAX / sizeof(float)) {
+        payload_set_err(err, errlen, "packed fp8 span has a bad element count");
+        return 1;
+    }
+    const uint64_t rows = count / row_elems;
+    if (rows > ds4_gpu_tensor_bytes(tensor) / stride) {
+        payload_set_err(err, errlen, "session tensor is smaller than the packed fp8 payload");
+        return 1;
+    }
+    const size_t rows_per = cap / (size_t)(stride + row_in);
+    if (rows_per == 0) {
+        payload_set_err(err, errlen, "session tensor conversion buffer is too small");
+        return 1;
+    }
+    uint8_t *pk = buf;
+    float *f = (float *)(void *)(buf + rows_per * stride);
+    uint64_t done = 0;
+    while (done < rows) {
+        const size_t n = rows - done > (uint64_t)rows_per
+            ? rows_per
+            : (size_t)(rows - done);
+        if (payload_read_bytes(fp, f, (uint64_t)n * row_in, remaining, err, errlen) != 0) return 1;
+        for (size_t r = 0; r < n; r++) {
+            const float *src = f + r * row_elems;
+            uint8_t *dst = pk + r * stride;
+            float rowmax = 0.0f;
+            for (uint32_t i = 0; i < row_elems; i++)
+                rowmax = fmaxf(rowmax, fabsf(src[i]));
+            const float scale = rowmax > 0.0f ? rowmax / 448.0f : 1.0f;
+            const float inv = rowmax > 0.0f ? 448.0f / rowmax : 0.0f;
+            for (uint32_t i = 0; i < row_elems; i++)
+                dst[i] = glm_fp8_e4m3_encode(src[i] * inv);
+            memcpy(dst + row_elems, &scale, sizeof(float));
+            memset(dst + row_elems + sizeof(float), 0,
+                   (size_t)(stride - row_elems - sizeof(float)));
+        }
+        if (ds4_gpu_tensor_write(tensor, done * stride, pk, (uint64_t)n * stride) == 0) {
+            payload_set_err(err, errlen, "failed to restore packed fp8 session tensor");
+            return 1;
+        }
+        done += n;
+    }
+    return 0;
+}
+
+/* packed_row_elems: the packed-row width of THIS tensor under format 2
+ * (DS4_N_KV_LORA / DS4_N_ROT), or 0 for tensors that stay element-uniform
+ * under fp8 (the indexer key cache). */
+static int payload_write_glm_compact_span(FILE *fp, const ds4_gpu_tensor *tensor,
+                                          uint64_t count, uint32_t packed_row_elems,
+                                          uint8_t *buf, size_t cap,
+                                          char *err, size_t errlen) {
+    if (glm_graph_compact_cache_format() == 2u && packed_row_elems != 0u) {
+        return payload_write_packed_fp8_span_as_f32(fp, tensor, count, packed_row_elems,
+                                                    buf, cap, err, errlen);
     }
     if (glm_graph_compact_cache_is_f16()) {
         return payload_write_tensor_span_f16_as_f32(fp, tensor, 0, count, buf, cap, err, errlen);
@@ -48823,12 +48962,12 @@ static int payload_write_glm_compact_span(FILE *fp, const ds4_gpu_tensor *tensor
 }
 
 static int payload_read_glm_compact_span(FILE *fp, ds4_gpu_tensor *tensor,
-                                         uint64_t count, uint8_t *buf, size_t cap,
+                                         uint64_t count, uint32_t packed_row_elems,
+                                         uint8_t *buf, size_t cap,
                                          uint64_t *remaining, char *err, size_t errlen) {
-    if (glm_graph_compact_cache_format() == 2u) {
-        payload_set_err(err, errlen, "session restore requires the f16/f32 compact "
-                        "cache (packed fp8 rows are not serializable yet)");
-        return 1;
+    if (glm_graph_compact_cache_format() == 2u && packed_row_elems != 0u) {
+        return payload_read_f32_span_as_packed_fp8(fp, tensor, count, packed_row_elems,
+                                                   buf, cap, remaining, err, errlen);
     }
     if (glm_graph_compact_cache_is_f16()) {
         return payload_read_tensor_span_f32_as_f16(fp, tensor, 0, count, buf, cap, remaining, err, errlen);
@@ -49162,6 +49301,7 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
             rc = payload_write_glm_compact_span(fp,
                                                 g->layer_kv_lora_cache[il],
                                                 (uint64_t)compact_live * DS4_N_KV_LORA,
+                                                DS4_N_KV_LORA,
                                                 buf,
                                                 DS4_SESSION_IO_CHUNK,
                                                 err,
@@ -49170,6 +49310,7 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                 rc = payload_write_glm_compact_span(fp,
                                                     g->layer_k_rope_cache[il],
                                                     (uint64_t)compact_live * DS4_N_ROT,
+                                                    DS4_N_ROT,
                                                     buf,
                                                     DS4_SESSION_IO_CHUNK,
                                                     err,
@@ -49179,6 +49320,7 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                 rc = payload_write_glm_compact_span(fp,
                                                     g->layer_indexer_key_cache[il],
                                                     (uint64_t)compact_live * DS4_N_INDEXER_HEAD_DIM,
+                                                    0,
                                                     buf,
                                                     DS4_SESSION_IO_CHUNK,
                                                     err,
@@ -49488,6 +49630,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
             rc = payload_read_glm_compact_span(fp,
                                                g->layer_kv_lora_cache[il],
                                                (uint64_t)n_comp[i] * DS4_N_KV_LORA,
+                                               DS4_N_KV_LORA,
                                                buf,
                                                DS4_SESSION_IO_CHUNK,
                                                &remaining,
@@ -49497,6 +49640,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                 rc = payload_read_glm_compact_span(fp,
                                                    g->layer_k_rope_cache[il],
                                                    (uint64_t)n_comp[i] * DS4_N_ROT,
+                                                   DS4_N_ROT,
                                                    buf,
                                                    DS4_SESSION_IO_CHUNK,
                                                    &remaining,
@@ -49507,6 +49651,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                 rc = payload_read_glm_compact_span(fp,
                                                    g->layer_indexer_key_cache[il],
                                                    (uint64_t)n_index_comp[i] * DS4_N_INDEXER_HEAD_DIM,
+                                                   0,
                                                    buf,
                                                    DS4_SESSION_IO_CHUNK,
                                                    &remaining,
@@ -50140,6 +50285,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
             rc = payload_write_glm_compact_span(fp,
                                                 g->layer_kv_lora_cache[il],
                                                 (uint64_t)compact_live * DS4_N_KV_LORA,
+                                                DS4_N_KV_LORA,
                                                 buf,
                                                 DS4_SESSION_IO_CHUNK,
                                                 err,
@@ -50148,6 +50294,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                 rc = payload_write_glm_compact_span(fp,
                                                     g->layer_k_rope_cache[il],
                                                     (uint64_t)compact_live * DS4_N_ROT,
+                                                    DS4_N_ROT,
                                                     buf,
                                                     DS4_SESSION_IO_CHUNK,
                                                     err,
@@ -50157,6 +50304,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                 rc = payload_write_glm_compact_span(fp,
                                                     g->layer_indexer_key_cache[il],
                                                     (uint64_t)compact_live * DS4_N_INDEXER_HEAD_DIM,
+                                                    0,
                                                     buf,
                                                     DS4_SESSION_IO_CHUNK,
                                                     err,
@@ -50527,6 +50675,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             rc = payload_read_glm_compact_span(fp,
                                                g->layer_kv_lora_cache[il],
                                                (uint64_t)expected_compact_live * DS4_N_KV_LORA,
+                                               DS4_N_KV_LORA,
                                                buf,
                                                DS4_SESSION_IO_CHUNK,
                                                &remaining,
@@ -50536,6 +50685,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                 rc = payload_read_glm_compact_span(fp,
                                                    g->layer_k_rope_cache[il],
                                                    (uint64_t)expected_compact_live * DS4_N_ROT,
+                                                   DS4_N_ROT,
                                                    buf,
                                                    DS4_SESSION_IO_CHUNK,
                                                    &remaining,
@@ -50546,6 +50696,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                 rc = payload_read_glm_compact_span(fp,
                                                    g->layer_indexer_key_cache[il],
                                                    (uint64_t)expected_compact_live * DS4_N_INDEXER_HEAD_DIM,
+                                                   0,
                                                    buf,
                                                    DS4_SESSION_IO_CHUNK,
                                                    &remaining,

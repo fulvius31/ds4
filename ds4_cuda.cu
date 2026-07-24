@@ -25384,12 +25384,6 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
                 UINT64_MAX / sizeof(float)) {
             return 0;
         }
-        if (g_glm_cache_format == 2u && range_tok2) {
-            fprintf(stderr,
-                    "ds4: fp8 compact cache does not support the tok2 verify "
-                    "path (disable --glm-mtp or the fp8 cache)\n");
-            return 0;
-        }
         /* Under fp8 the gather is mandatory at every n_selected: it is the
          * only reader that understands packed rows, and it hands the
          * pregathered f32 kernels exactly what they expect. */
@@ -28202,14 +28196,6 @@ extern "C" int ds4_gpu_glm_store_compact_kv_tensor(
     }
     dim3 grid(n_tokens, 2, 1);
     if (g_glm_cache_format == 2u) {
-        if (kv_lora_cache->bytes <
-                (uint64_t)cache_cap * glm_fp8_row_stride(kv_lora_dim) ||
-            k_rope_cache->bytes <
-                (uint64_t)cache_cap * glm_fp8_row_stride(qk_rope)) {
-            fprintf(stderr,
-                    "ds4: CUDA fp8 compact store: cache too small for packed rows\n");
-            return 0;
-        }
         glm_store_compact_kv_fp8_kernel<<<grid, 128>>>(
                 (char *)kv_lora_cache->ptr,
                 (char *)k_rope_cache->ptr,
