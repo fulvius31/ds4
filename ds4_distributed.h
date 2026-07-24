@@ -100,6 +100,22 @@ int ds4_dist_session_eval(
         char *err,
         size_t errlen);
 
+/* GLM MTP span (1 = seed, 2 = verify): the tail worker runs the draft
+ * machinery (it owns the nextn layer and the output head) and returns the
+ * post-decision logits row (vocab f32 into logits_row: seed/reject -> row0,
+ * accept -> row1) plus mtp_out = { n1, n2 (or -1), next_draft (or -1) }.
+ * No rebuild fallback — the caller falls back to plain eval on failure. */
+int ds4_dist_session_eval_mtp(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        const ds4_tokens *checkpoint,
+        const int *tokens,
+        uint32_t n_tokens,
+        float *logits_row,
+        int *mtp_out,
+        char *err,
+        size_t errlen);
+
 /* Save/load use the normal DSV4 payload format. The coordinator gathers or
  * pushes remote layer shards internally so saved files are topology-neutral.
  */

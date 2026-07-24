@@ -56,12 +56,18 @@
 #define DS4_DIST_WORK_F_OUTPUT_LOGITS 0x00000002u
 #define DS4_DIST_WORK_F_RESET_SESSION 0x00000004u
 #define DS4_DIST_WORK_F_ACK_ONLY 0x00000008u
+#define DS4_DIST_WORK_F_MTP 0x00000010u
 #define DS4_DIST_WORK_F_VALID_MASK \
     (DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS | \
-     DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY)
+     DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY | \
+     DS4_DIST_WORK_F_MTP)
 #define DS4_DIST_RESULT_ACK 0u
 #define DS4_DIST_RESULT_HIDDEN_STATE 1u
 #define DS4_DIST_RESULT_LOGITS 2u
+/* GLM MTP tail result: one vocab-sized f32 logits row (the row after the
+ * tail's accept decision: seed/reject -> row0, accept -> row1) followed by
+ * a 12-byte trailer { int32 n1; int32 n2 (-1 on seed/reject); int32 draft }. */
+#define DS4_DIST_RESULT_MTP 3u
 #define DS4_DIST_ACTIVATION_BITS_DEFAULT 32u
 #define DS4_DIST_ROUTE_F_OUTPUT_LOGITS 0x00000001u
 #define DS4_DIST_ROUTE_RETURN_UPSTREAM 1u
@@ -2503,6 +2509,7 @@ static int dist_coordinator_send_remote_work_on_fd(
         uint64_t result_hash,
         bool reset_session,
         bool ack_only,
+        bool mtp,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
         char *err,
@@ -2527,6 +2534,7 @@ static int dist_coordinator_send_remote_work_on_fd(
     work.flags = DS4_DIST_WORK_F_INPUT_HC;
     if (reset_session) work.flags |= DS4_DIST_WORK_F_RESET_SESSION;
     if (ack_only) work.flags |= DS4_DIST_WORK_F_ACK_ONLY;
+    if (mtp) work.flags |= DS4_DIST_WORK_F_MTP;
     if ((first->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0) {
         work.flags |= DS4_DIST_WORK_F_OUTPUT_LOGITS;
     }
@@ -2567,6 +2575,8 @@ static int dist_coordinator_eval_remote_on_fd(
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
         float *logits,
+        float *mtp_hidden_rows,
+        int *mtp_out,
         char *err,
         size_t errlen) {
     const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
@@ -2584,6 +2594,7 @@ static int dist_coordinator_eval_remote_on_fd(
                                                      expected_result_hash,
                                                      reset_session,
                                                      false,
+                                                     mtp_out != NULL,
                                                      hidden_hc,
                                                      hidden_hc_bytes,
                                                      err,
@@ -2622,6 +2633,29 @@ static int dist_coordinator_eval_remote_on_fd(
         return 1;
     }
 
+    if (mtp_out != NULL) {
+        const uint64_t vocab_bytes =
+            (uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float);
+        const uint32_t mtp_bytes =
+            (uint32_t)(vocab_bytes + 3u * sizeof(int32_t));
+        if (kind != DS4_DIST_RESULT_MTP || payload_bytes != mtp_bytes) {
+            free(payload);
+            if (errlen) snprintf(err, errlen,
+                                 "distributed route did not return an MTP "
+                                 "result (kind %u, %u bytes)", kind,
+                                 payload_bytes);
+            return 1;
+        }
+        memcpy(mtp_hidden_rows, payload, (size_t)vocab_bytes);
+        int32_t trailer[3];
+        memcpy(trailer, (const uint8_t *)payload + vocab_bytes,
+               sizeof(trailer));
+        mtp_out[0] = trailer[0];
+        mtp_out[1] = trailer[1];
+        mtp_out[2] = trailer[2];
+        free(payload);
+        return 0;
+    }
     const uint32_t logits_bytes = (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
     if (kind == DS4_DIST_RESULT_LOGITS && payload_bytes == logits_bytes) {
         const double copy_t0 = profile ? dist_now_sec() : 0.0;
@@ -2678,10 +2712,17 @@ static int dist_coordinator_eval_span(
         uint64_t request_id,
         bool reset_session,
         float *logits,
+        float *mtp_hidden_rows,
+        int *mtp_out,
         char *err,
         size_t errlen) {
     const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
     const double span_t0 = profile ? dist_now_sec() : 0.0;
+    if (mtp_out != NULL && plan->count == 0) {
+        if (errlen) snprintf(err, errlen,
+                             "MTP requires a remote final-layer worker");
+        return 1;
+    }
     const uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
     const uint64_t hidden_bytes64 = (uint64_t)n_tokens * hc_values * sizeof(float);
     if (hidden_bytes64 > UINT32_MAX) {
@@ -2761,6 +2802,8 @@ static int dist_coordinator_eval_span(
                                                 hidden,
                                                 hidden_bytes,
                                                 logits,
+                                                mtp_hidden_rows,
+                                                mtp_out,
                                                 err,
                                                 errlen);
         remote_t1 = profile ? dist_now_sec() : 0.0;
@@ -3058,7 +3101,8 @@ static int dist_write_logprobs_dump(
         if (dist_coordinator_eval_span(state, session, plan,
                                        &token, 1, token_pos,
                                        session_id, (*request_id)++,
-                                       false, logits, err, sizeof(err)) != 0) {
+                                       false, logits, NULL, NULL,
+                                       err, sizeof(err)) != 0) {
             fprintf(stderr,
                     "ds4: distributed decode failed while dumping logprobs: %s\n",
                     err);
@@ -3234,6 +3278,7 @@ static void *dist_prefill_sender_main(void *arg) {
                                                          slot->result_hash,
                                                          slot->reset_session,
                                                          slot->ack_only,
+                                                         false,
                                                          slot->hidden,
                                                          slot->hidden_bytes,
                                                          send_err,
@@ -3818,7 +3863,8 @@ static int dist_coordinator_prefill_prompt(
         int eval_rc = dist_coordinator_eval_span(state, session, plan,
                                                  prompt->v + pos, chunk, pos,
                                                  session_id, (*request_id)++,
-                                                 pos == 0, logits, err, errlen);
+                                                 pos == 0, logits, NULL, NULL,
+                                                 err, errlen);
         if (eval_rc != 0) {
             return eval_rc;
         }
@@ -4057,7 +4103,8 @@ static int dist_run_coordinator_generation(
         int decode_rc = dist_coordinator_eval_span(state, session, &plan,
                                                    &token, 1, token_pos,
                                                    session_id, request_id++,
-                                                   false, logits, err, sizeof(err));
+                                                   false, logits, NULL, NULL,
+                                                   err, sizeof(err));
         if (decode_rc != 0) {
             fprintf(stderr, "\nds4: distributed decode failed: %s\n", err);
             if (dist_coordinator_rebuild_from_transcript(state,
@@ -5593,6 +5640,8 @@ int ds4_dist_session_sync(
                                                      d->request_id++,
                                                      false,
                                                      logits,
+                                                     NULL,
+                                                     NULL,
                                                      err,
                                                      errlen);
             if (eval_rc != 0) {
@@ -5674,6 +5723,8 @@ int ds4_dist_session_eval(
                                         d->request_id++,
                                         false,
                                         logits,
+                                        NULL,
+                                        NULL,
                                         err,
                                         errlen);
     if (rc != 0) {
@@ -5701,6 +5752,38 @@ int ds4_dist_session_eval(
         rc = 0;
     }
     return rc;
+}
+
+int ds4_dist_session_eval_mtp(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        const ds4_tokens *checkpoint,
+        const int *tokens,
+        uint32_t n_tokens,
+        float *logits_row,
+        int *mtp_out,
+        char *err,
+        size_t errlen) {
+    if (!d || !owner || !checkpoint || !tokens || n_tokens == 0 ||
+        n_tokens > 2 || !logits_row || !mtp_out) {
+        if (errlen) snprintf(err, errlen, "invalid distributed MTP request");
+        return 1;
+    }
+    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    return dist_coordinator_eval_span(&d->state,
+                                      owner,
+                                      &d->plan,
+                                      tokens,
+                                      n_tokens,
+                                      (uint32_t)checkpoint->len,
+                                      d->session_id,
+                                      d->request_id++,
+                                      false,
+                                      NULL,
+                                      logits_row,
+                                      mtp_out,
+                                      err,
+                                      errlen);
 }
 
 /* =========================================================================
@@ -7402,15 +7485,29 @@ static int dist_worker_process_work_payload(
 
     const bool final_ack_only = ack_only && !has_next;
     const bool local_output_logits = output_logits && !has_next && !final_ack_only;
-    const bool produce_hidden = !local_output_logits && !final_ack_only;
+    const bool mtp_work = (work.flags & DS4_DIST_WORK_F_MTP) != 0;
+    if (mtp_work && (!local_output_logits || work.n_tokens > 2u)) {
+        free(route_blob);
+        free(tokens);
+        return dist_worker_upstream_send_work_error(upstream, request_id,
+            "MTP work requires the final-output worker and 1-2 tokens");
+    }
+    const bool produce_hidden =
+        (!local_output_logits && !final_ack_only) || mtp_work;
     const uint32_t result_kind = final_ack_only
         ? DS4_DIST_RESULT_ACK
-        : (local_output_logits ? DS4_DIST_RESULT_LOGITS : DS4_DIST_RESULT_HIDDEN_STATE);
+        : (mtp_work
+            ? DS4_DIST_RESULT_MTP
+            : (local_output_logits ? DS4_DIST_RESULT_LOGITS
+                                   : DS4_DIST_RESULT_HIDDEN_STATE));
     const uint32_t result_bytes = final_ack_only
         ? 0u
-        : (local_output_logits
-            ? (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float))
-            : expected_hc_bytes);
+        : (mtp_work
+            ? (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float)) +
+              3u * (uint32_t)sizeof(int32_t)
+            : (local_output_logits
+                ? (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float))
+                : expected_hc_bytes));
     float *result = result_bytes ? malloc(result_bytes) : NULL;
     if (result_bytes && !result) {
         free(route_blob);
@@ -7490,6 +7587,20 @@ static int dist_worker_process_work_payload(
         return dist_worker_upstream_send_work_error(upstream, request_id, "worker KV prefix hash mismatch");
     }
     const double eval_t0 = dist_now_sec();
+    float *mtp_hc = NULL;
+    if (mtp_work) {
+        DIST_DEBUG("worker mtp span begin n=%u pos=%u", work.n_tokens, work.pos0);
+        mtp_hc = malloc(expected_hc_bytes);
+        if (!mtp_hc) {
+            pthread_mutex_unlock(&state->mu);
+            if (!input_hc_uses_wire) free(input_hc);
+            free(result);
+            free(route_blob);
+            free(tokens);
+            return dist_worker_upstream_send_work_error(upstream, request_id,
+                "out of memory allocating MTP hidden rows");
+        }
+    }
     int eval_rc = ds4_session_eval_layer_slice(session->session,
                                                tokens,
                                                work.n_tokens,
@@ -7497,9 +7608,10 @@ static int dist_worker_process_work_payload(
                                                work.layer_start,
                                                work.layer_end,
                                                input_hc,
-                                               produce_hidden ? result : NULL,
-                                               local_output_logits,
-                                               local_output_logits ? result : NULL,
+                                               mtp_work ? mtp_hc
+                                                        : (produce_hidden ? result : NULL),
+                                               local_output_logits && !mtp_work,
+                                               (local_output_logits && !mtp_work) ? result : NULL,
                                                err,
                                                sizeof(err));
     const double eval_t1 = dist_now_sec();
@@ -7509,6 +7621,60 @@ static int dist_worker_process_work_payload(
     } else {
         session->token_hash_valid = false;
     }
+    int mtp_status = 0;
+    if (mtp_work && eval_rc == 0) {
+        const uint32_t vocab = (uint32_t)ds4_engine_vocab_size(state->engine);
+        const uint64_t hidden_dim = ds4_engine_hidden_f32_values(state->engine);
+        float *lg = malloc((size_t)work.n_tokens * vocab * sizeof(float));
+        int n1 = -1, n2 = -1, draft = -1, committed = 0;
+        bool rows_ok = lg != NULL;
+        /* The from-hc head evaluates one row per call. */
+        for (uint32_t r = 0; rows_ok && r < work.n_tokens; r++) {
+            DIST_DEBUG("worker mtp head row %u/%u", r + 1u, work.n_tokens);
+            rows_ok = ds4_session_eval_output_head_from_hc(
+                          session->session,
+                          mtp_hc + (uint64_t)r * hidden_dim,
+                          1, lg + (uint64_t)r * vocab,
+                          err, sizeof(err)) == 0;
+        }
+        if (rows_ok) DIST_DEBUG("worker mtp tail update n=%u pos=%u",
+                                work.n_tokens, work.pos0);
+        if (!rows_ok ||
+            ds4_session_glm_mtp_tail_update(session->session,
+                                            mtp_hc,
+                                            tokens, work.n_tokens,
+                                            work.pos0, lg,
+                                            &n1, &n2, &draft,
+                                            &committed) != 0) {
+            if (!err[0]) snprintf(err, sizeof(err), "MTP tail update failed");
+            mtp_status = 1;
+            /* Roll the slice back to the request's prefix so the
+             * coordinator's plain-eval fallback retries cleanly instead of
+             * tripping the hash chain into a full rebuild. */
+            ds4_session_rewind(session->session, (int)work.pos0);
+            session->token_hash = work_prefix_hash;
+            session->token_hash_valid = true;
+        } else {
+            if (work.n_tokens == 2u && committed == 1) {
+                /* Rejected draft: the coordinator commits only tokens[0], so
+                 * roll the slice checkpoint and the hash chain back to the
+                 * committed prefix (the KV row rewrites on the next span). */
+                ds4_session_rewind(session->session, (int)work.pos0 + 1);
+                session->token_hash =
+                    dist_token_hash_update_span(work_prefix_hash, tokens, 1);
+            }
+            /* Ship the post-decision logits row: accept -> row1, else row0. */
+            const float *row = (committed == 2) ? lg + vocab : lg;
+            memcpy(result, row, (size_t)vocab * sizeof(float));
+            int32_t trailer[3] = { n1, n2, draft };
+            memcpy((uint8_t *)result + (size_t)vocab * sizeof(float), trailer,
+                   sizeof(trailer));
+            DIST_DEBUG("worker mtp span done committed=%d n1=%d draft=%d",
+                       committed, n1, draft);
+        }
+        free(lg);
+    }
+    free(mtp_hc);
     pthread_mutex_unlock(&state->mu);
     DIST_DEBUG("worker eval request=%llu layers=%u:%u tokens=%u pos=%u has_next=%d output=%d rc=%d",
                (unsigned long long)request_id,
@@ -7520,7 +7686,7 @@ static int dist_worker_process_work_payload(
                local_output_logits ? 1 : 0,
                eval_rc);
 
-    if (eval_rc != 0) {
+    if (eval_rc != 0 || mtp_status != 0) {
         if (!input_hc_uses_wire) free(input_hc);
         free(result);
         free(route_blob);

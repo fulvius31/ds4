@@ -444,6 +444,14 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          float *logits,
                                          char *err,
                                          size_t errlen);
+/* Tail-rank GLM MTP bookkeeping for distributed MTP work spans (accept
+ * decision, nextn KV upkeep, next draft). Greedy-deterministic, so the
+ * coordinator reaches the same accept from the returned argmaxes. */
+int ds4_session_glm_mtp_tail_update(ds4_session *s, const float *hidden_rows,
+                                    const int *tokens, uint32_t n_tokens,
+                                    uint32_t pos0, const float *logits_rows,
+                                    int *n1_out, int *n2_out,
+                                    int *draft_out, int *n_committed_out);
 
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */

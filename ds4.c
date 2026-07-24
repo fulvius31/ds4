@@ -5874,9 +5874,11 @@ static void weights_bind(
         weights_bind_layer(&w->layer[il], m, il);
     }
     /* GLM nextn/MTP block(s): excluded from the executable pass but bound
-     * so the drafter can run them. Only when the full model is loaded. */
+     * so the drafter can run them. Bound whenever the load includes the tail
+     * executable layer — the full model, and any distributed slice that owns
+     * the output (the pipeline tail runs the drafter for MTP work spans). */
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
-        start == 0 && end == executable_layers - 1u) {
+        end == executable_layers - 1u) {
         for (uint32_t il = executable_layers; il < DS4_N_LAYER; il++) {
             weights_bind_layer(&w->layer[il], m, il);
         }
@@ -6279,6 +6281,22 @@ static DS4_MAYBE_UNUSED bool weights_model_map_spans(
     memset(spans, 0, sizeof(*spans));
     if (layer_start == 0) model_map_span_vec_include_one(spans, w->token_embd);
     for (uint32_t il = layer_start; il <= layer_end; il++) {
+        /* Distributed tail slices keep the drafter's dense nextn tensors
+         * resident (~0.5 GiB) but leave the routed nextn experts out of the
+         * arena: full residency (~6 GiB) breaks the slice budget, and spans
+         * outside the arena are unreadable. The drafter runs dense-only on
+         * slices (shared expert + attention), which only costs acceptance —
+         * every draft is still verified by the main model. */
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+            layer_start != 0 &&
+            il >= DS4_N_LAYER - DS4_N_NEXTN_PREDICT) {
+            ds4_layer_weights dense = w->layer[il];
+            dense.ffn_gate_exps = NULL;
+            dense.ffn_up_exps = NULL;
+            dense.ffn_down_exps = NULL;
+            model_map_span_vec_include_layer(spans, &dense);
+            continue;
+        }
         model_map_span_vec_include_layer(spans, &w->layer[il]);
     }
     if (include_output) model_map_span_vec_include_output(spans, w);
@@ -42719,9 +42737,11 @@ static bool glm_graph_mtp_step(
                                                     DS4_N_EMBD,
                                                     DS4_RMS_EPS) != 0;
     /* nextn sparse FFN: router + split routed experts (BIG-gate combine
-     * under TP) + shared expert. */
+     * under TP) + shared expert. Distributed slices draft dense-only: the
+     * routed nextn experts are not in the slice's arena. */
+    const bool dense_only_draft = g->layer_start != 0;
     DS4_GLM_MTP_STAGE("router");
-    if (ok) ok = ds4_gpu_matmul_f32_tensor(g->router_logits,
+    if (ok && !dense_only_draft) ok = ds4_gpu_matmul_f32_tensor(g->router_logits,
                                            model->map,
                                            model->size,
                                            l->ffn_gate_inp->abs_offset,
@@ -42730,7 +42750,7 @@ static bool glm_graph_mtp_step(
                                            g->ffn_norm,
                                            1) != 0;
     DS4_GLM_MTP_STAGE("router_select");
-    if (ok) ok = ds4_gpu_glm_router_select_tensor(g->router_selected,
+    if (ok && !dense_only_draft) ok = ds4_gpu_glm_router_select_tensor(g->router_selected,
                                                   g->router_weights,
                                                   g->router_probs,
                                                   model->map,
@@ -42741,7 +42761,10 @@ static bool glm_graph_mtp_step(
                                                   DS4_N_EXPERT_USED,
                                                   DS4_EXPERT_WEIGHT_SCALE) != 0;
     DS4_GLM_MTP_STAGE("routed");
-    if (ok) {
+    if (ok && dense_only_draft) {
+        ok = ds4_gpu_tensor_fill_f32(g->ffn_out, 0.0f, DS4_N_EMBD) != 0;
+    }
+    if (ok && !dense_only_draft) {
         uint64_t gate_in = 0, gate_out = 0, gate_row_bytes = 0;
         uint64_t up_in = 0, up_out = 0, up_row_bytes = 0;
         uint64_t down_in = 0, down_out = 0, down_row_bytes = 0;
@@ -48086,6 +48109,7 @@ struct ds4_session {
     int glm_mtp_draft;
     int glm_mtp_have;
     int glm_spec_inside;
+    int glm_mtp_dist_off;
     uint32_t glm_mtp_min_pos;
     float *glm_mtp_hc;
     float *glm_mtp_logits0;
@@ -57943,6 +57967,141 @@ static int ds4_session_glm_spec_cycle(ds4_session *s, int first_token,
     }
     return n_committed;
 }
+
+/* Tail-rank MTP bookkeeping for the distributed pipeline: given the slice's
+ * final hidden rows and per-row shared-head logits for an MTP work span,
+ * decide accept (greedy, so the coordinator reaches the same answer from the
+ * returned argmaxes), keep the nextn layer's KV current, and produce the
+ * next draft. Mirrors ds4_session_glm_spec_cycle's accept/reject steps. */
+int ds4_session_glm_mtp_tail_update(ds4_session *s, const float *hidden_rows,
+                                    const int *tokens, uint32_t n_tokens,
+                                    uint32_t pos0, const float *logits_rows,
+                                    int *n1_out, int *n2_out,
+                                    int *draft_out, int *n_committed_out) {
+    if (!s || !hidden_rows || !tokens || !logits_rows || !n1_out ||
+        !n2_out || !draft_out || !n_committed_out ||
+        n_tokens == 0 || n_tokens > 2 ||
+        !ds4_session_is_glm(s) || DS4_N_NEXTN_PREDICT == 0 ||
+        !s->glm_graph_ready) {
+        return 1;
+    }
+    ds4_engine *e = s->engine;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (s->glm_mtp_min_pos == 0 || s->glm_mtp_min_pos > pos0) {
+        s->glm_mtp_min_pos = pos0;
+    }
+    const int n1 = glm_session_logits_argmax(logits_rows);
+    int n2 = -1;
+    int draft = -1;
+    int committed = 1;
+    bool ok;
+    if (n_tokens == 1u) {
+        ok = ds4_gpu_tensor_write(g->cur, 0, hidden_rows,
+                                  (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
+             glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos0,
+                                s->glm_mtp_min_pos, &draft);
+    } else if (n1 == tokens[1]) {
+        n2 = glm_session_logits_argmax(logits_rows + DS4_N_VOCAB);
+        int dummy = -1;
+        committed = 2;
+        ok = ds4_gpu_tensor_write(g->cur, 0, hidden_rows,
+                                  (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
+             glm_graph_mtp_step(g, &e->model, &e->weights, tokens[1], pos0,
+                                s->glm_mtp_min_pos, &dummy) &&
+             ds4_gpu_tensor_write(g->cur, 0, hidden_rows + DS4_N_EMBD,
+                                  (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
+             glm_graph_mtp_step(g, &e->model, &e->weights, n2, pos0 + 1u,
+                                s->glm_mtp_min_pos, &draft);
+    } else {
+        ok = ds4_gpu_tensor_write(g->cur, 0, hidden_rows,
+                                  (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
+             glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos0,
+                                s->glm_mtp_min_pos, &draft);
+    }
+    *n1_out = n1;
+    *n2_out = n2;
+    *draft_out = ok ? draft : -1;
+    *n_committed_out = committed;
+    return 0;
+}
+
+/* Coordinator-side MTP cycle for distributed pipeline sessions: the tail
+ * worker runs the draft machinery (nextn lives in its slice) and returns
+ * hidden rows + its greedy argmaxes + the next draft; this side commits and
+ * heads the final committed row for the sampler's logits. */
+static int ds4_session_glm_spec_cycle_dist(ds4_session *s, int first_token,
+                                           int *accepted, int accepted_cap,
+                                           char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    const bool timing = e->glm_mtp_timing;
+    int mtp_out[3] = { -1, -1, -1 };
+    const double t0 = timing ? now_sec() : 0.0;
+    if (!s->glm_mtp_have || accepted_cap < 2 ||
+        (uint32_t)s->checkpoint.len + 2u > (uint32_t)s->ctx_size) {
+        /* Seed: single-token MTP span; the tail drafts off it and returns
+         * the row's logits directly (the coordinator has no output head). */
+        s->glm_mtp_have = 0;
+        if (ds4_dist_session_eval_mtp(s->distributed, s, &s->checkpoint,
+                                      &first_token, 1, s->logits,
+                                      mtp_out, err, errlen) != 0) {
+            s->glm_mtp_dist_off = 1;
+            ds4_log(stderr, DS4_LOG_WARNING,
+                    "ds4: glm mtp: distributed draft path disabled: %s\n",
+                    err[0] ? err : "seed span failed");
+            return -1;
+        }
+        /* The coordinator's local slice eval already appended the span
+         * token to the checkpoint. */
+        s->checkpoint_valid = true;
+        s->glm_mtp_draft = mtp_out[2];
+        s->glm_mtp_have = s->glm_mtp_draft >= 0;
+        accepted[0] = first_token;
+        return 1;
+    }
+    const int d = s->glm_mtp_draft;
+    s->glm_mtp_have = 0;
+    const uint32_t pos0 = (uint32_t)s->checkpoint.len;
+    int toks[2] = { first_token, d };
+    if (ds4_dist_session_eval_mtp(s->distributed, s, &s->checkpoint,
+                                  toks, 2, s->logits,
+                                  mtp_out, err, errlen) != 0) {
+        s->glm_mtp_dist_off = 1;
+        ds4_log(stderr, DS4_LOG_WARNING,
+                "ds4: glm mtp: distributed draft path disabled: %s\n",
+                err[0] ? err : "verify span failed");
+        return -1;
+    }
+    const double t1 = timing ? now_sec() : 0.0;
+    const int n1 = mtp_out[0];
+    const int accept = n1 == d;
+    /* Both span tokens were appended by the local slice eval; on a reject
+     * drop the draft again (the worker did the same on its side). */
+    s->checkpoint_valid = true;
+    accepted[0] = first_token;
+    int n_committed = 1;
+    if (accept) {
+        accepted[1] = d;
+        n_committed = 2;
+    } else {
+        ds4_session_rewind(s, (int)pos0 + 1);
+    }
+    /* s->logits already holds the post-decision row from the tail. */
+    s->glm_mtp_draft = mtp_out[2];
+    s->glm_mtp_have = s->glm_mtp_draft >= 0;
+    if (timing) {
+        char *dt = ds4_token_text(e, d, NULL);
+        char *nt = ds4_token_text(e, n1, NULL);
+        fprintf(stderr,
+                "ds4: glm mtp dist cycle: span %.1f ms, %s "
+                "(draft %d '%s' vs true %d '%s')\n",
+                (t1 - t0) * 1000.0,
+                accept ? "ACCEPT" : "reject",
+                d, dt ? dt : "?", n1, nt ? nt : "?");
+        free(dt);
+        free(nt);
+    }
+    return n_committed;
+}
 #endif
 
 static int ds4_session_slice_check_timeline(
@@ -64633,6 +64792,20 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     if (s->distributed) {
         if (!accepted) return 0;
+#ifndef DS4_NO_GPU
+        if (ds4_session_is_glm(s) && s->engine->glm_mtp &&
+            DS4_N_NEXTN_PREDICT != 0 && !s->glm_mtp_dist_off &&
+            s->checkpoint_valid) {
+            const int rc = ds4_session_glm_spec_cycle_dist(s, first_token,
+                                                           accepted,
+                                                           accepted_cap,
+                                                           err, errlen);
+            if (rc >= 0) return rc;
+            /* Nothing was committed on failure; the plain path below
+             * retries the same token (with its rebuild machinery), and the
+             * cycle latched glm_mtp_dist_off so this is a one-time cost. */
+        }
+#endif
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
