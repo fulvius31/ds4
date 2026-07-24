@@ -59445,6 +59445,26 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             snprintf(err, errlen, "%s GLM graph is not initialized", backend_name);
             return 1;
         }
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+        /* Cold-start QoL: fill the streamed-expert pool to budget now,
+         * while nothing competes for memory or the copy engines, instead
+         * of paying the chunk mallocs across the first ~100 decode
+         * tokens. Idempotent; DS4_CUDA_NO_POOL_PREGROW restores the old
+         * lazy growth. */
+        if (s->glm_graph.ssd_streaming &&
+            DS4_N_LAYER > DS4_N_LEADING_DENSE &&
+            DS4_N_EXPERT > 0) {
+            const ds4_layer_weights *pregrow_layer =
+                &e->weights.layer[DS4_N_LEADING_DENSE];
+            if (pregrow_layer->ffn_gate_exps && pregrow_layer->ffn_down_exps) {
+                ds4_gpu_stream_expert_pool_pregrow(
+                        DS4_N_EXPERT,
+                        DS4_N_LEADING_DENSE,
+                        pregrow_layer->ffn_gate_exps->bytes / DS4_N_EXPERT,
+                        pregrow_layer->ffn_down_exps->bytes / DS4_N_EXPERT);
+            }
+        }
+#endif
         if ((uint32_t)prompt->len >= s->glm_graph.ctx_size) {
             snprintf(err, errlen, "prompt length %d leaves no GLM Metal context room (ctx %u)",
                      prompt->len, s->glm_graph.ctx_size);
