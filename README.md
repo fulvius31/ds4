@@ -10,7 +10,7 @@ Sparks firing as one: tensor parallelism over a direct RoCE link, serving a
 
 And *GLM* is the model's name, but around here it stands for **Gran Language
 Model** — in the Gran Turismo tradition: not the largest engine on the road,
-but the one built to cross a continent (or 200,000 tokens of context) in
+but the one built to cross a continent (or 400,000 tokens of context) in
 comfort.
 
 This is a downstream distribution of [antirez's DwarfStar
@@ -34,15 +34,19 @@ not just runnable but interactive — with month-scale reliability discipline
 
 | Mode | Prefill | Decode | Context |
 |---|---:|---:|---|
-| **TP + SSD streaming** (the flagship) | 58.7 t/s | 3.3 t/s @45k, ~3.0 @100k | **up to 200,000** |
+| **TP + SSD streaming** (the flagship) | 58.7 t/s | 3.3 t/s @45k, 2.66 @190k | up to 200,000 (f16 KV) |
+| **TP + fp8 KV cache** (opt-in) | 52.8 t/s @190k, 46.5 @350k | 2.66 @190k, 2.39 @350k | **up to 400,000** |
 | Pipeline resident (short-context daily driver) | 90 t/s | 5.9 t/s | ≤ 12,288 |
 | Pipeline + SSD streaming | ~68 t/s | 2.7 t/s | long-context fallback |
 
-Validated, not vibes: 100k-deep needle retrieval is exact, temp-0 outputs are
-byte-identical across cold starts (verified through every optimization), and
-the 200k envelope allocates and runs inside the same ~90 GiB planned budget
-that the memory runbook proves safe. Decode at 45k went **2.23 → 3.29 t/s
-(+48%)** across this fork's optimization cycles.
+Validated, not vibes: needle-at-depth retrieval is **exact at 100k, 190k and
+350k** (the last one under fp8 at ctx 400,000 — 19.2 GiB of KV where f16
+would need 35.5 and not fit), temp-0 outputs are byte-identical across cold
+starts (verified through every optimization), and every envelope allocates
+and runs inside the same ~90 GiB planned budget the memory runbook proves
+safe. Decode at 45k went **2.23 → 3.29 t/s (+48%)** across this fork's
+optimization cycles, and fp8 costs none of it: 45k and 190k rates match f16
+to the second decimal.
 
 ## Quick start
 
@@ -65,6 +69,11 @@ Context/pool envelope (per-box planned memory stays ≤ ~90 GiB):
 | 50,000 | 6,000 | soak-validated workhorse |
 | 100,000 | 5,000 | needle-validated at depth |
 | 200,000 | 5,000 | f16 KV cache (default on CUDA) |
+| 400,000 | 5,000 | `DS4_GLM_FP8_KV_STORE=1` on **both** boxes; needle-exact at 350k |
+
+The fp8 cache packs each KV row to e4m3 values plus one f32 scale (~54% of
+f16). It is opt-in and experimental; the default stays f16, and
+`DS4_GLM_COMPACT_CACHE_F32=1` still restores the f32 era for A/B.
 
 Pipeline mode (`run_glm_worker.sh` then `run_glm_coordinator.sh`) keeps the
 whole model resident split across the pair: fastest short-context, ctx capped
@@ -84,10 +93,21 @@ at 12,288 — its coordinator runs ~1 GiB from the memory ceiling by design.
 - **f16 compact KV cache on CUDA** via a runtime switch — halves KV, doubled
   the validated context to 200k. `DS4_GLM_COMPACT_CACHE_F32=1` restores f32
   for A/B without rebuilding.
+- **Packed fp8 KV cache** (`DS4_GLM_FP8_KV_STORE=1`): e4m3 rows with per-row
+  absmax scales, ~54% of f16 → the 400k envelope. Decode reads go through a
+  dequantizing gather into f32 scratch and batch prefill through an f16
+  unpack stage, so every attention kernel runs unmodified. Needle-exact at
+  190k and 350k with f16-identical speed.
 - **Async selected-expert staging** with real CUDA readback events.
 - **KV session save/restore across the pair** (`--kv-save` / `--kv-load`,
   `/save` `/load` in the REPL): kill both ranks, relaunch, continue the
-  conversation with only new tokens prefilled.
+  conversation with only new tokens prefilled. Sessions are format-portable:
+  an fp8 session restores into an f16 run and vice versa (one universal file
+  format; fp8 requantizes on load, exactly). Tensor-parallel leaders refuse
+  `--kv-load` loudly — the worker's mirrored session cannot be restored yet;
+  restore on a single box or the pipeline coordinator.
+- **Reboot-proof RDMA bring-up**: the launch scripts discover the RoCE v2
+  GID index at start (reboots and docker network churn shuffle the table).
 - **Server fixes** for GLM thinking mode (unclosed reasoning surfaces as
   `reasoning_content`, never as content), ported from the upstream PR queue
   with credit (#524; #158 in part; #460 for the miss uploads).
@@ -101,9 +121,10 @@ session documents, not product docs); ask in issues if you want any of them.
 
 ## Roadmap
 
-- fp8 compact KV (Metal PR #418 pattern) → ~400k context in the same budget
 - Prefill staging/compute overlap + grouped GEMM → 60–100 t/s target
-- 190k-depth needle confirmation run at the new 200k envelope
+- TP session restore (push the restored cache to the worker, or re-prefill
+  the transcript on load) — today TP `--kv-load` refuses by design
+- fp8 quality fixture beyond needle retrieval, gating any default-on
 - MTP speculative probe on the resident pipeline config
 
 ## Credits
