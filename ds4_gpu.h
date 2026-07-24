@@ -93,6 +93,12 @@ int ds4_gpu_selected_readback_event_supported(void);
  * cache_f16 contract (store + every reader). Consulted once at runtime by
  * the shared graph to pick the cache element type off-Apple. */
 int ds4_gpu_glm_compact_cache_f16_supported(void);
+/* Eagerly allocate the streamed-expert pool to its full budget (no-op when
+ * already full, streaming off, or the backend has no pool). */
+void ds4_gpu_stream_expert_pool_pregrow(uint32_t n_total_expert,
+                                        uint32_t layer,
+                                        uint64_t gate_expert_bytes,
+                                        uint64_t down_expert_bytes);
 int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              uint64_t offset,
                                              void *data,

@@ -276,6 +276,62 @@ static int cuda_expert_pool_grow(void) {
     return 1;
 }
 
+static double cuda_wall_sec(void);
+
+/* Eagerly allocate every pool chunk up to the budget. Called at session
+ * sync start, when memory pressure is lowest: the 2+ GiB chunk mallocs
+ * otherwise interleave with the first ~60-100 decode tokens (the cold-start
+ * crawl). Idempotent — returns immediately once the pool is full — and
+ * inherits grow()'s budget-freeze on allocation failure. */
+extern "C" void ds4_gpu_stream_expert_pool_pregrow(
+        uint32_t n_total_expert,
+        uint32_t layer,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (!g_ssd_streaming_mode) return;
+    if (getenv("DS4_CUDA_NO_POOL_PREGROW") != NULL) return;
+    if (!cuda_expert_pool_ensure(n_total_expert, layer,
+                                 gate_expert_bytes, down_expert_bytes)) {
+        return;
+    }
+    if (g_expert_pool.slots >= g_expert_pool.budget) return;
+    const double t0 = cuda_wall_sec();
+    uint32_t chunks = 0;
+    while (g_expert_pool.slots < g_expert_pool.budget) {
+        if (!cuda_expert_pool_grow()) break;
+        chunks++;
+        /* Pressure guard: pre-growing races the weight-cache demand load,
+         * and an unchecked burst is exactly the GB10 OOM-freeze hazard the
+         * lazy growth was designed to avoid (it memguard-killed a pool-8000
+         * launch). Below 8 GiB available, stop and let the remaining
+         * chunks grow lazily as before. */
+        FILE *mi = fopen("/proc/meminfo", "r");
+        if (mi) {
+            char line[128];
+            unsigned long long avail_kb = 0;
+            while (fgets(line, sizeof(line), mi)) {
+                if (sscanf(line, "MemAvailable: %llu", &avail_kb) == 1) break;
+            }
+            fclose(mi);
+            if (avail_kb > 0 && avail_kb < 8ull * 1024ull * 1024ull) {
+                fprintf(stderr,
+                        "ds4: CUDA expert pool pre-grow paused at %u/%u slots "
+                        "(MemAvailable %.1f GiB)\n",
+                        g_expert_pool.slots, g_expert_pool.budget,
+                        (double)avail_kb / 1048576.0);
+                break;
+            }
+        }
+    }
+    if (chunks) {
+        fprintf(stderr,
+                "ds4: CUDA expert pool pre-grown to %u/%u slots "
+                "(%u chunks, %.2fs)\n",
+                g_expert_pool.slots, g_expert_pool.budget, chunks,
+                cuda_wall_sec() - t0);
+    }
+}
+
 /* Find or claim a pool slot for key.  Returns 0 only when the pool has
  * no usable slots at all. */
 static int cuda_expert_pool_acquire(uint32_t key, uint32_t *slot_out,

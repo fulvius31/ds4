@@ -8855,6 +8855,15 @@ int ds4_gpu_glm_compact_cache_f16_supported(void) {
     return 1;
 }
 
+void ds4_gpu_stream_expert_pool_pregrow(uint32_t n_total_expert,
+                                        uint32_t layer,
+                                        uint64_t gate_expert_bytes,
+                                        uint64_t down_expert_bytes) {
+    /* The CUDA expert LRU pool has no Metal counterpart. */
+    (void)n_total_expert; (void)layer;
+    (void)gate_expert_bytes; (void)down_expert_bytes;
+}
+
 int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              uint64_t offset,
                                              void *data,
