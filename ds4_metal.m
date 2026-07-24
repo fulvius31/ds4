@@ -8849,6 +8849,12 @@ int ds4_gpu_selected_readback_event_supported(void) {
     return 0;
 }
 
+int ds4_gpu_glm_compact_cache_f16_supported(void) {
+    /* Metal short-circuits on the compile-time flag before consulting
+     * this; defined for link completeness. */
+    return 1;
+}
+
 int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              uint64_t offset,
                                              void *data,

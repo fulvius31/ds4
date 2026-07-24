@@ -29401,6 +29401,13 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
     g_glm_model_mode = enabled ? 1 : 0;
 }
 
+extern "C" int ds4_gpu_glm_compact_cache_f16_supported(void) {
+    /* Every compact-cache store and reader in this file carries the
+     * cache_f16 branch (Metal-contract mirror); the gather kernel is
+     * CT-templated with both instantiations dispatched. */
+    return 1;
+}
+
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_stream_selected_cache_invalidate();
