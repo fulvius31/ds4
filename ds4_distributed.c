@@ -66,7 +66,8 @@
 #define DS4_DIST_RESULT_LOGITS 2u
 /* GLM MTP tail result: one vocab-sized f32 logits row (the row after the
  * tail's accept decision: seed/reject -> row0, accept -> row1) followed by
- * a 12-byte trailer { int32 n1; int32 n2 (-1 on seed/reject); int32 draft }. */
+ * a 16-byte trailer { int32 n1; int32 n2 (-1 on seed/reject); int32 draft;
+ * f32 draft_confidence (as bits) }. */
 #define DS4_DIST_RESULT_MTP 3u
 #define DS4_DIST_ACTIVATION_BITS_DEFAULT 32u
 #define DS4_DIST_ROUTE_F_OUTPUT_LOGITS 0x00000001u
@@ -2579,7 +2580,7 @@ static int dist_coordinator_eval_remote_on_fd(
         int *mtp_out,
         char *err,
         size_t errlen) {
-    const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
+    const bool profile = dist_decode_profile_enabled() && n_tokens <= 2;
     const double total_t0 = profile ? dist_now_sec() : 0.0;
     const double send_t0 = profile ? dist_now_sec() : 0.0;
     int rc = dist_coordinator_send_remote_work_on_fd(state,
@@ -2637,7 +2638,7 @@ static int dist_coordinator_eval_remote_on_fd(
         const uint64_t vocab_bytes =
             (uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float);
         const uint32_t mtp_bytes =
-            (uint32_t)(vocab_bytes + 3u * sizeof(int32_t));
+            (uint32_t)(vocab_bytes + 4u * sizeof(int32_t));
         if (kind != DS4_DIST_RESULT_MTP || payload_bytes != mtp_bytes) {
             free(payload);
             if (errlen) snprintf(err, errlen,
@@ -2647,12 +2648,13 @@ static int dist_coordinator_eval_remote_on_fd(
             return 1;
         }
         memcpy(mtp_hidden_rows, payload, (size_t)vocab_bytes);
-        int32_t trailer[3];
+        int32_t trailer[4];
         memcpy(trailer, (const uint8_t *)payload + vocab_bytes,
                sizeof(trailer));
         mtp_out[0] = trailer[0];
         mtp_out[1] = trailer[1];
         mtp_out[2] = trailer[2];
+        mtp_out[3] = trailer[3];
         free(payload);
         return 0;
     }
@@ -2716,7 +2718,7 @@ static int dist_coordinator_eval_span(
         int *mtp_out,
         char *err,
         size_t errlen) {
-    const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
+    const bool profile = dist_decode_profile_enabled() && n_tokens <= 2;
     const double span_t0 = profile ? dist_now_sec() : 0.0;
     if (mtp_out != NULL && plan->count == 0) {
         if (errlen) snprintf(err, errlen,
@@ -7268,7 +7270,7 @@ static int dist_worker_process_work_payload(
                                                            work.prefix_hash_lo);
     const uint64_t work_result_hash = dist_u64_from_halves(work.result_hash_hi,
                                                            work.result_hash_lo);
-    const bool profile = dist_decode_profile_enabled() && work.n_tokens == 1;
+    const bool profile = dist_decode_profile_enabled() && work.n_tokens <= 2;
     const double total_t0 = profile ? dist_now_sec() : 0.0;
     DIST_DEBUG("worker work request=%llu layers=%u:%u tokens=%u pos=%u flags=0x%x token_bytes=%u input_hc=%u/%ub route_count=%u route_index=%u route_bytes=%u",
                (unsigned long long)request_id,
@@ -7504,7 +7506,7 @@ static int dist_worker_process_work_payload(
         ? 0u
         : (mtp_work
             ? (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float)) +
-              3u * (uint32_t)sizeof(int32_t)
+              4u * (uint32_t)sizeof(int32_t)
             : (local_output_logits
                 ? (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float))
                 : expected_hc_bytes));
@@ -7627,6 +7629,7 @@ static int dist_worker_process_work_payload(
         const uint64_t hidden_dim = ds4_engine_hidden_f32_values(state->engine);
         float *lg = malloc((size_t)work.n_tokens * vocab * sizeof(float));
         int n1 = -1, n2 = -1, draft = -1, committed = 0;
+        float draft_conf = 0.0f;
         bool rows_ok = lg != NULL;
         /* The from-hc head evaluates one row per call. */
         for (uint32_t r = 0; rows_ok && r < work.n_tokens; r++) {
@@ -7644,7 +7647,7 @@ static int dist_worker_process_work_payload(
                                             mtp_hc,
                                             tokens, work.n_tokens,
                                             work.pos0, lg,
-                                            &n1, &n2, &draft,
+                                            &n1, &n2, &draft, &draft_conf,
                                             &committed) != 0) {
             if (!err[0]) snprintf(err, sizeof(err), "MTP tail update failed");
             mtp_status = 1;
@@ -7666,11 +7669,12 @@ static int dist_worker_process_work_payload(
             /* Ship the post-decision logits row: accept -> row1, else row0. */
             const float *row = (committed == 2) ? lg + vocab : lg;
             memcpy(result, row, (size_t)vocab * sizeof(float));
-            int32_t trailer[3] = { n1, n2, draft };
+            int32_t trailer[4] = { n1, n2, draft, 0 };
+            memcpy(&trailer[3], &draft_conf, sizeof(float));
             memcpy((uint8_t *)result + (size_t)vocab * sizeof(float), trailer,
                    sizeof(trailer));
-            DIST_DEBUG("worker mtp span done committed=%d n1=%d draft=%d",
-                       committed, n1, draft);
+            DIST_DEBUG("worker mtp span done committed=%d n1=%d draft=%d conf=%.3f",
+                       committed, n1, draft, (double)draft_conf);
         }
         free(lg);
     }

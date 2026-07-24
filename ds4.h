@@ -451,7 +451,8 @@ int ds4_session_glm_mtp_tail_update(ds4_session *s, const float *hidden_rows,
                                     const int *tokens, uint32_t n_tokens,
                                     uint32_t pos0, const float *logits_rows,
                                     int *n1_out, int *n2_out,
-                                    int *draft_out, int *n_committed_out);
+                                    int *draft_out, float *conf_out,
+                                    int *n_committed_out);
 
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */

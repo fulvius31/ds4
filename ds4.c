@@ -48110,6 +48110,7 @@ struct ds4_session {
     int glm_mtp_have;
     int glm_spec_inside;
     int glm_mtp_dist_off;
+    float glm_mtp_conf;
     uint32_t glm_mtp_min_pos;
     float *glm_mtp_hc;
     float *glm_mtp_logits0;
@@ -57968,16 +57969,38 @@ static int ds4_session_glm_spec_cycle(ds4_session *s, int first_token,
     return n_committed;
 }
 
+/* Softmax probability of the drafted token over the nextn head's logits
+ * (left in mtp_logits_host by the last mtp step) — the DSpark-style draft
+ * confidence the coordinator schedules speculation with. */
+static float glm_graph_mtp_draft_confidence(const ds4_glm_gpu_graph *g,
+                                            int draft) {
+    if (!g->mtp_logits_host || draft < 0 || draft >= (int)DS4_N_VOCAB) {
+        return 0.0f;
+    }
+    const float *l = g->mtp_logits_host;
+    float m = l[0];
+    for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
+        if (l[i] > m) m = l[i];
+    }
+    double sum = 0.0;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        sum += exp((double)(l[i] - m));
+    }
+    if (sum <= 0.0) return 0.0f;
+    return (float)(exp((double)(l[draft] - m)) / sum);
+}
+
 /* Tail-rank MTP bookkeeping for the distributed pipeline: given the slice's
  * final hidden rows and per-row shared-head logits for an MTP work span,
  * decide accept (greedy, so the coordinator reaches the same answer from the
  * returned argmaxes), keep the nextn layer's KV current, and produce the
- * next draft. Mirrors ds4_session_glm_spec_cycle's accept/reject steps. */
+ * next draft with its confidence. Mirrors ds4_session_glm_spec_cycle. */
 int ds4_session_glm_mtp_tail_update(ds4_session *s, const float *hidden_rows,
                                     const int *tokens, uint32_t n_tokens,
                                     uint32_t pos0, const float *logits_rows,
                                     int *n1_out, int *n2_out,
-                                    int *draft_out, int *n_committed_out) {
+                                    int *draft_out, float *conf_out,
+                                    int *n_committed_out) {
     if (!s || !hidden_rows || !tokens || !logits_rows || !n1_out ||
         !n2_out || !draft_out || !n_committed_out ||
         n_tokens == 0 || n_tokens > 2 ||
@@ -57987,7 +58010,11 @@ int ds4_session_glm_mtp_tail_update(ds4_session *s, const float *hidden_rows,
     }
     ds4_engine *e = s->engine;
     ds4_glm_gpu_graph *g = &s->glm_graph;
-    if (s->glm_mtp_min_pos == 0 || s->glm_mtp_min_pos > pos0) {
+    if (n_tokens == 1u || s->glm_mtp_min_pos == 0 ||
+        s->glm_mtp_min_pos > pos0) {
+        /* Seed spans always restart the drafter's attention window: plain
+         * decoding may have advanced positions without nextn KV coverage
+         * (confidence-scheduled declines), so the old window has holes. */
         s->glm_mtp_min_pos = pos0;
     }
     const int n1 = glm_session_logits_argmax(logits_rows);
@@ -58021,6 +58048,10 @@ int ds4_session_glm_mtp_tail_update(ds4_session *s, const float *hidden_rows,
     *n1_out = n1;
     *n2_out = n2;
     *draft_out = ok ? draft : -1;
+    if (conf_out) {
+        *conf_out = (ok && draft >= 0)
+            ? glm_graph_mtp_draft_confidence(g, draft) : 0.0f;
+    }
     *n_committed_out = committed;
     return 0;
 }
@@ -58034,8 +58065,30 @@ static int ds4_session_glm_spec_cycle_dist(ds4_session *s, int first_token,
                                            char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     const bool timing = e->glm_mtp_timing;
-    int mtp_out[3] = { -1, -1, -1 };
+    int mtp_out[4] = { -1, -1, -1, 0 };
+    static float conf_threshold = -1.0f;
+    if (conf_threshold < 0.0f) {
+        const char *t = getenv("DS4_GLM_MTP_CONF");
+        conf_threshold = t ? (float)atof(t) : 0.60f;
+        ds4_log(stderr, DS4_LOG_KVCACHE,
+                "ds4: glm mtp: draft confidence threshold %.2f "
+                "(DS4_GLM_MTP_CONF)\n", (double)conf_threshold);
+    }
     const double t0 = timing ? now_sec() : 0.0;
+    /* Confidence scheduling (DSpark): a 2-token verify span costs ~2x a
+     * plain eval on this MoE (expert traffic is linear in span tokens), so
+     * burn one only on confident drafts. A weak draft is dropped and its
+     * token goes through a 1-token seed span instead, which re-drafts —
+     * every cycle stays on the mtp span path (seed or verify), the traffic
+     * pattern proven stable across long runs. */
+    if (s->glm_mtp_have && s->glm_mtp_conf < conf_threshold) {
+        if (timing) {
+            fprintf(stderr,
+                    "ds4: glm mtp dist cycle: reseed (draft conf %.3f < %.2f)\n",
+                    (double)s->glm_mtp_conf, (double)conf_threshold);
+        }
+        s->glm_mtp_have = 0;
+    }
     if (!s->glm_mtp_have || accepted_cap < 2 ||
         (uint32_t)s->checkpoint.len + 2u > (uint32_t)s->ctx_size) {
         /* Seed: single-token MTP span; the tail drafts off it and returns
@@ -58055,6 +58108,7 @@ static int ds4_session_glm_spec_cycle_dist(ds4_session *s, int first_token,
         s->checkpoint_valid = true;
         s->glm_mtp_draft = mtp_out[2];
         s->glm_mtp_have = s->glm_mtp_draft >= 0;
+        memcpy(&s->glm_mtp_conf, &mtp_out[3], sizeof(float));
         accepted[0] = first_token;
         return 1;
     }
@@ -58088,15 +58142,17 @@ static int ds4_session_glm_spec_cycle_dist(ds4_session *s, int first_token,
     /* s->logits already holds the post-decision row from the tail. */
     s->glm_mtp_draft = mtp_out[2];
     s->glm_mtp_have = s->glm_mtp_draft >= 0;
+    memcpy(&s->glm_mtp_conf, &mtp_out[3], sizeof(float));
     if (timing) {
         char *dt = ds4_token_text(e, d, NULL);
         char *nt = ds4_token_text(e, n1, NULL);
         fprintf(stderr,
                 "ds4: glm mtp dist cycle: span %.1f ms, %s "
-                "(draft %d '%s' vs true %d '%s')\n",
+                "(draft %d '%s' vs true %d '%s', next conf %.3f)\n",
                 (t1 - t0) * 1000.0,
                 accept ? "ACCEPT" : "reject",
-                d, dt ? dt : "?", n1, nt ? nt : "?");
+                d, dt ? dt : "?", n1, nt ? nt : "?",
+                (double)s->glm_mtp_conf);
         free(dt);
         free(nt);
     }
