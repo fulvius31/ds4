@@ -620,14 +620,21 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         if (saved) ds4_tokens_copy(&continuation, saved);
         restored_tokens = continuation.len;
         if (cfg->engine.tp.role == DS4_TP_LEADER) {
-            /* The worker's mirrored session cannot receive the restored
-             * cache bytes, so rewind (mirrored to the worker) and let the
-             * sync re-prefill the whole transcript on both ranks. */
-            ds4_log(stderr, DS4_LOG_KVCACHE,
-                    "ds4: tensor-parallel restore: re-prefilling %d restored "
-                    "tokens so the worker's mirrored session stays in lockstep\n",
-                    restored_tokens);
-            ds4_session_rewind(session, 0);
+            const double t_push0 = cli_now_sec();
+            if (ds4_session_tp_kv_push_file(session, cfg->kv_load_path) == 0) {
+                ds4_log(stderr, DS4_LOG_KVCACHE,
+                        "ds4: tensor-parallel restore: payload pushed to the "
+                        "worker's mirrored session in %.1fs (no re-prefill)\n",
+                        cli_now_sec() - t_push0);
+            } else {
+                /* Fall back to the always-correct path: rewind (mirrored to
+                 * the worker) and re-prefill the transcript on both ranks. */
+                ds4_log(stderr, DS4_LOG_KVCACHE,
+                        "ds4: tensor-parallel restore: payload push failed; "
+                        "re-prefilling %d restored tokens instead\n",
+                        restored_tokens);
+                ds4_session_rewind(session, 0);
+            }
         }
         if (cfg->gen.prompt) {
             ds4_chat_append_message(engine, &continuation, "user", cfg->gen.prompt);
@@ -1504,12 +1511,16 @@ static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx
 static int repl_restore_kv(repl_chat *chat, const cli_config *cfg, const char *path) {
     if (cli_kv_load_file(chat->session, path) != 0) return 1;
     if (cfg->engine.tp.role == DS4_TP_LEADER) {
-        /* Mirrored-session restore: rewind (sent to the worker too) and let
-         * the next sync re-prefill the transcript on both ranks. */
-        ds4_log(stderr, DS4_LOG_KVCACHE,
-                "ds4: tensor-parallel restore: the restored transcript will "
-                "re-prefill so the worker's mirrored session stays in lockstep\n");
-        ds4_session_rewind(chat->session, 0);
+        if (ds4_session_tp_kv_push_file(chat->session, path) == 0) {
+            ds4_log(stderr, DS4_LOG_KVCACHE,
+                    "ds4: tensor-parallel restore: payload pushed to the "
+                    "worker's mirrored session (no re-prefill)\n");
+        } else {
+            ds4_log(stderr, DS4_LOG_KVCACHE,
+                    "ds4: tensor-parallel restore: payload push failed; the "
+                    "restored transcript will re-prefill on both ranks\n");
+            ds4_session_rewind(chat->session, 0);
+        }
     }
     chat->transcript.len = 0;
     const ds4_tokens *saved = ds4_session_tokens(chat->session);
