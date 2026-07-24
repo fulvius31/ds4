@@ -1,16 +1,17 @@
-# twinspark-glm — the Grand Language Model
+# twinspark-GranLanguageModel
 
 **GLM 5.2 at 2-bit, running interactively across two NVIDIA DGX Sparks.**
+(`twinspark-glm` for short.)
 
 *Twin Spark*, as in Alfa Romeo's twin-ignition engines — two spark plugs per
 cylinder, firing together for a cleaner, stronger burn. Here it is two DGX
 Sparks firing as one: tensor parallelism over a direct RoCE link, serving a
 196.6 GiB model on a pair of 121.69 GiB boxes.
 
-And *GLM* is the model's name, but around here it stands for **Grand
-Language Model** — in the Gran Turismo tradition: not the largest engine on
-the road, but the one built to cross a continent (or 200,000 tokens of
-context) in comfort.
+And *GLM* is the model's name, but around here it stands for **Gran Language
+Model** — in the Gran Turismo tradition: not the largest engine on the road,
+but the one built to cross a continent (or 200,000 tokens of context) in
+comfort.
 
 This is a downstream distribution of [antirez's DwarfStar
 (ds4)](https://github.com/antirez/ds4) (MIT), focused on exactly one thing.
