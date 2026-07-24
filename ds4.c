@@ -35173,12 +35173,28 @@ static uint32_t glm_graph_indexed_prefill_score_tokens(
         uint32_t indexed_prefill_cap,
         uint32_t compact_cap);
 
-static uint64_t glm_graph_compact_cache_elem_bytes(void) {
-    return DS4_GPU_GLM_COMPACT_CACHE_F16 ? sizeof(uint16_t) : sizeof(float);
+static uint32_t glm_graph_compact_cache_is_f16(void) {
+    /* Metal compiles the compact cache as F16 (stable since the original
+     * port). Off-Apple the decision is runtime: ds4.o is backend-agnostic
+     * on Linux, so ask the linked backend. The CUDA kernels have carried
+     * the full cache_f16 contract since the Metal-mirror work; this switch
+     * finally engages it. DS4_GLM_COMPACT_CACHE_F32=1 forces the old F32
+     * cache (A/B and escape hatch, no rebuild needed). */
+    if (DS4_GPU_GLM_COMPACT_CACHE_F16) return 1u;
+#if defined(DS4_ROCM_BUILD) || defined(DS4_NO_GPU)
+    return 0u;
+#else
+    static int cached = -1;
+    if (cached < 0) {
+        cached = (getenv("DS4_GLM_COMPACT_CACHE_F32") == NULL &&
+                  ds4_gpu_glm_compact_cache_f16_supported()) ? 1 : 0;
+    }
+    return (uint32_t)cached;
+#endif
 }
 
-static uint32_t glm_graph_compact_cache_is_f16(void) {
-    return DS4_GPU_GLM_COMPACT_CACHE_F16 ? 1u : 0u;
+static uint64_t glm_graph_compact_cache_elem_bytes(void) {
+    return glm_graph_compact_cache_is_f16() ? sizeof(uint16_t) : sizeof(float);
 }
 
 static bool glm_graph_expanded_kv_cache_enabled(bool ssd_streaming) {
@@ -38678,7 +38694,12 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected)
            (DS4_N_HEAD % 8u) == 0 &&
            DS4_N_KV_LORA == 512u &&
            DS4_N_ROT == 64u &&
-           glm_graph_compact_cache_is_f16();
+           /* The fused group8 kernel exists only in the Metal backend, so
+            * gate on the compile-time f16 build, not the runtime cache
+            * dtype: with the runtime f16 switch on CUDA this must stay
+            * false so the staged chain (which carries cache_f16 arms)
+            * keeps the decode. */
+           DS4_GPU_GLM_COMPACT_CACHE_F16;
 }
 
 static bool glm_graph_prefill_stage_sync_boundary(void) {

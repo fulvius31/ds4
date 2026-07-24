@@ -89,6 +89,10 @@ int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label
  * (record at signal, event wait + private-stream copy at read). Backends
  * without it fall back to wait_ready + tensor_read. */
 int ds4_gpu_selected_readback_event_supported(void);
+/* Nonzero when the backend's GLM compact-cache kernels implement the
+ * cache_f16 contract (store + every reader). Consulted once at runtime by
+ * the shared graph to pick the cache element type off-Apple. */
+int ds4_gpu_glm_compact_cache_f16_supported(void);
 int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              uint64_t offset,
                                              void *data,
