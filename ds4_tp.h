@@ -162,6 +162,11 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
                             const ds4_tp_batch_item *items,
                             uint32_t count);
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status);
+/* Stream a saved session payload (the .dsv4 bytes) to the worker, which
+ * applies it to the mirrored session — a restore without re-prefill.
+ * Returns 1 and consumes total_bytes from fp on success. */
+int ds4_tp_send_kv_load_file(ds4_tp *tp, uint64_t session_id, FILE *fp,
+                             uint64_t total_bytes, char *err, size_t errlen);
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen);
 int ds4_tp_send_stop(ds4_tp *tp);
@@ -188,6 +193,9 @@ typedef enum {
     DS4_TP_FRAME_EVAL_BATCH = 15,
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
+    DS4_TP_FRAME_KV_LOAD_BEGIN = 18,
+    DS4_TP_FRAME_KV_LOAD_CHUNK = 19,
+    DS4_TP_FRAME_KV_LOAD_END = 20,
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -199,6 +207,8 @@ typedef struct {
     uint32_t n_tokens;
     ds4_tp_batch_item *items;
     uint32_t n_items;
+    uint8_t *blob;
+    uint32_t blob_bytes;
 } ds4_tp_command;
 
 int ds4_tp_recv_command(

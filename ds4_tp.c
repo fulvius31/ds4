@@ -1791,6 +1791,11 @@ typedef struct {
     uint32_t reserved;
 } ds4_tp_command_ack;
 
+typedef struct {
+    uint64_t session_id;
+    uint64_t total_bytes;
+} ds4_tp_kv_load_header;
+
 static int tp_send_token_command(ds4_tp *tp, uint32_t type,
                                  uint64_t session_id, const int *tokens,
                                  uint32_t count) {
@@ -1924,6 +1929,7 @@ void ds4_tp_command_free(ds4_tp_command *command) {
     if (!command) return;
     free(command->tokens);
     free(command->items);
+    free(command->blob);
     memset(command, 0, sizeof(*command));
     command->type = DS4_TP_FRAME_ERROR;
 }
@@ -2041,6 +2047,32 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         command->n_items = h.item_count;
         break;
     }
+    case DS4_TP_FRAME_KV_LOAD_BEGIN: {
+        ds4_tp_kv_load_header h;
+        if (bytes != sizeof(h)) { ok = 0; break; }
+        memcpy(&h, payload, sizeof(h));
+        command->session_id = h.session_id;
+        command->seq = h.total_bytes;
+        break;
+    }
+    case DS4_TP_FRAME_KV_LOAD_CHUNK: {
+        if (bytes < sizeof(command->session_id)) { ok = 0; break; }
+        memcpy(&command->session_id, payload, sizeof(command->session_id));
+        const uint32_t blob =
+            bytes - (uint32_t)sizeof(command->session_id);
+        if (blob != 0) {
+            command->blob = malloc(blob);
+            if (!command->blob) { ok = -1; break; }
+            memcpy(command->blob,
+                   payload + sizeof(command->session_id), blob);
+            command->blob_bytes = blob;
+        }
+        break;
+    }
+    case DS4_TP_FRAME_KV_LOAD_END:
+        if (bytes != sizeof(command->session_id)) { ok = 0; break; }
+        memcpy(&command->session_id, payload, sizeof(command->session_id));
+        break;
     case DS4_TP_FRAME_STOP:
         if (bytes != 0) ok = 0;
         break;
@@ -2061,6 +2093,50 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     }
     command->type = (ds4_tp_frame_type)ftype;
     return 1;
+}
+
+int ds4_tp_send_kv_load_file(ds4_tp *tp, uint64_t session_id, FILE *fp,
+                             uint64_t total_bytes, char *err, size_t errlen) {
+    enum { DS4_TP_KV_CHUNK = 32u << 20 };
+    if (!tp || !fp || total_bytes == 0) {
+        tp_set_err(err, errlen, "tp: kv load bad arguments");
+        return 0;
+    }
+    ds4_tp_kv_load_header begin = { session_id, total_bytes };
+    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_KV_LOAD_BEGIN,
+                       &begin, sizeof(begin))) {
+        tp_set_err(err, errlen, "tp: kv load begin send failed");
+        return 0;
+    }
+    uint8_t *buf = malloc(sizeof(uint64_t) + DS4_TP_KV_CHUNK);
+    if (!buf) {
+        tp_set_err(err, errlen, "tp: kv load buffer allocation failed");
+        return 0;
+    }
+    memcpy(buf, &session_id, sizeof(uint64_t));
+    uint64_t left = total_bytes;
+    int ok = 1;
+    while (ok && left > 0) {
+        const size_t n = left > DS4_TP_KV_CHUNK ? DS4_TP_KV_CHUNK
+                                                : (size_t)left;
+        if (fread(buf + sizeof(uint64_t), 1, n, fp) != n) {
+            tp_set_err(err, errlen, "tp: kv load short read from payload");
+            ok = 0;
+            break;
+        }
+        ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_KV_LOAD_CHUNK,
+                           buf, (uint32_t)(sizeof(uint64_t) + n));
+        if (!ok) tp_set_err(err, errlen, "tp: kv load chunk send failed");
+        left -= n;
+    }
+    free(buf);
+    if (!ok) return 0;
+    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_KV_LOAD_END,
+                       &session_id, sizeof(session_id))) {
+        tp_set_err(err, errlen, "tp: kv load end send failed");
+        return 0;
+    }
+    return ds4_tp_wait_command_ack(tp, session_id, "kv load", err, errlen);
 }
 
 int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count) {
@@ -2232,6 +2308,11 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
 
     int rc = 0;
     ds4_tokens prompt = {0};
+    FILE *kv_spool = NULL;
+    uint64_t kv_spool_expect = 0, kv_spool_got = 0;
+    char kv_spool_path[512];
+    snprintf(kv_spool_path, sizeof(kv_spool_path), "%s/.ds4-tp-kvload.spool",
+             getenv("HOME") ? getenv("HOME") : "/tmp");
     while (1) {
         ds4_tp_command command;
         if (!ds4_tp_recv_command(tp, &command, err, sizeof(err))) {
@@ -2323,6 +2404,49 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             ds4_session_rewind(session, command.value);
         } else if (command.type == DS4_TP_FRAME_INVALIDATE) {
             ds4_session_invalidate(session);
+        } else if (command.type == DS4_TP_FRAME_KV_LOAD_BEGIN) {
+            if (kv_spool) fclose(kv_spool);
+            kv_spool = fopen(kv_spool_path, "w+b");
+            kv_spool_expect = command.seq;
+            kv_spool_got = 0;
+            if (!kv_spool) {
+                ds4_log(stderr, DS4_LOG_ERROR,
+                        "tp worker: kv load spool open failed: %s",
+                        kv_spool_path);
+            }
+        } else if (command.type == DS4_TP_FRAME_KV_LOAD_CHUNK) {
+            if (kv_spool && command.blob_bytes != 0) {
+                if (fwrite(command.blob, 1, command.blob_bytes, kv_spool) ==
+                        command.blob_bytes) {
+                    kv_spool_got += command.blob_bytes;
+                } else {
+                    ds4_log(stderr, DS4_LOG_ERROR,
+                            "tp worker: kv load spool write failed");
+                    fclose(kv_spool);
+                    kv_spool = NULL;
+                }
+            }
+        } else if (command.type == DS4_TP_FRAME_KV_LOAD_END) {
+            int status = 1;
+            if (kv_spool && kv_spool_got == kv_spool_expect &&
+                fseek(kv_spool, 0, SEEK_SET) == 0 &&
+                ds4_session_load_payload(session, kv_spool, kv_spool_got,
+                                         err, sizeof(err)) == 0) {
+                status = 0;
+                ds4_log(stderr, DS4_LOG_KVCACHE,
+                        "tp worker: mirrored session restored from pushed "
+                        "payload (%.2f GiB)",
+                        (double)kv_spool_got / 1073741824.0);
+            } else {
+                ds4_log(stderr, DS4_LOG_ERROR,
+                        "tp worker: kv load apply failed: %s",
+                        err[0] ? err : "spool incomplete");
+            }
+            if (kv_spool) { fclose(kv_spool); kv_spool = NULL; }
+            remove(kv_spool_path);
+            if (!ds4_tp_send_command_ack(tp, command.session_id, status)) {
+                rc = 1;
+            }
         } else if (command.type == DS4_TP_FRAME_EVAL_BATCH ||
                    command.type == DS4_TP_FRAME_MIXED_BATCH) {
             ds4_decode_item *items =
@@ -2377,6 +2501,10 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
         }
         ds4_tp_command_free(&command);
         if (rc != 0) break;
+    }
+    if (kv_spool) {
+        fclose(kv_spool);
+        remove(kv_spool_path);
     }
     ds4_tokens_free(&prompt);
     while (sessions.len != 0) {

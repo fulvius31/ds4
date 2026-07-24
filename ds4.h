@@ -410,6 +410,10 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                               char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
+/* Tensor-parallel leaders only: stream a saved session payload file to the
+ * worker so its mirrored session restores without re-prefill. Returns 0 on
+ * success (the worker acked the applied payload). */
+int ds4_session_tp_kv_push_file(ds4_session *s, const char *path);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);

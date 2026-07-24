@@ -65378,6 +65378,31 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 #endif
 }
 
+int ds4_session_tp_kv_push_file(ds4_session *s, const char *path) {
+    if (!s || !path || !ds4_session_tp_leader(s) || s->tp_session_id == 0 ||
+        ds4_tp_failed(s->engine->tp.ctx)) {
+        return 1;
+    }
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 1;
+    int rc = 1;
+    if (fseek(fp, 0, SEEK_END) == 0) {
+        const long size = ftell(fp);
+        if (size > 0 && fseek(fp, 0, SEEK_SET) == 0) {
+            char err[256] = "";
+            if (ds4_tp_send_kv_load_file(s->engine->tp.ctx, s->tp_session_id,
+                                         fp, (uint64_t)size,
+                                         err, sizeof(err))) {
+                rc = 0;
+            } else {
+                ds4_log(stderr, DS4_LOG_WARNING, "ds4: tp kv push: %s", err);
+            }
+        }
+    }
+    fclose(fp);
+    return rc;
+}
+
 int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
 }

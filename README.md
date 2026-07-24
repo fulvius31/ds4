@@ -106,9 +106,11 @@ at 12,288 — its coordinator runs ~1 GiB from the memory ceiling by design.
   an fp8 session restores into an f16 run and vice versa (one universal file
   format; fp8 requantizes on load — quantized codes survive round trips
   exactly, serialized floats wobble ≤2 ulp from scale re-derivation). On a
-  tensor-parallel leader, restore re-prefills the transcript so the worker's
-  mirrored session stays in lockstep. `-n 0` with `--kv-load`/`--kv-save`
-  is a generation-free pass-through for session surgery.
+  tensor-parallel leader, restore streams the payload to the worker over the
+  control connection so the mirrored session restores **without re-prefill**
+  (sub-second at chat scale; falls back to a mirrored re-prefill if the push
+  fails). `-n 0` with `--kv-load`/`--kv-save` is a generation-free
+  pass-through for session surgery.
 - **Reboot-proof RDMA bring-up**: the launch scripts discover the RoCE v2
   GID index at start (reboots and docker network churn shuffle the table).
 - **Server fixes** for GLM thinking mode (unclosed reasoning surfaces as
@@ -125,8 +127,8 @@ session documents, not product docs); ask in issues if you want any of them.
 ## Roadmap
 
 - Prefill staging/compute overlap + grouped GEMM → 60–100 t/s target
-- TP restore without re-prefill (push the restored cache to the worker over
-  the control connection)
+- Packed-row wire format for the TP restore push (ships e4m3 bytes instead
+  of f32 planes: ~7× less on the wire for huge fp8 sessions)
 - MTP speculative probe on the resident pipeline config
 
 ## Credits
