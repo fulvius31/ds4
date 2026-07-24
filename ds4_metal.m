@@ -8895,6 +8895,11 @@ int ds4_gpu_glm_compact_cache_f16_supported(void) {
     return 1;
 }
 
+int ds4_gpu_glm_compact_cache_fp8_supported(void) {
+    /* Packed fp8 rows are a CUDA-only format. */
+    return 0;
+}
+
 void ds4_gpu_stream_expert_pool_pregrow(uint32_t n_total_expert,
                                         uint32_t layer,
                                         uint64_t gate_expert_bytes,
@@ -8902,6 +8907,23 @@ void ds4_gpu_stream_expert_pool_pregrow(uint32_t n_total_expert,
     /* The CUDA expert LRU pool has no Metal counterpart. */
     (void)n_total_expert; (void)layer;
     (void)gate_expert_bytes; (void)down_expert_bytes;
+}
+
+void ds4_gpu_set_glm_compact_cache_format(uint32_t fmt) {
+    /* Metal's cache format is compile-time; packed fp8 is CUDA-only. */
+    (void)fmt;
+}
+
+int ds4_gpu_glm_compact_fp8_stage_unpack(const ds4_gpu_tensor *kv_lora_cache,
+                                         const ds4_gpu_tensor *k_rope_cache,
+                                         uint32_t rows,
+                                         uint32_t kv_lora_dim,
+                                         uint32_t qk_rope,
+                                         ds4_gpu_tensor **lora_out,
+                                         ds4_gpu_tensor **rope_out) {
+    (void)kv_lora_cache; (void)k_rope_cache; (void)rows;
+    (void)kv_lora_dim; (void)qk_rope; (void)lora_out; (void)rope_out;
+    return 0;
 }
 
 int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,

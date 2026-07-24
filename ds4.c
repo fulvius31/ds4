@@ -35204,15 +35204,37 @@ static uint32_t glm_graph_compact_cache_is_f16(void) {
  * payload serializer (needs an fp8_as_f32 sibling). Activating the env
  * before that would mis-handle the packed row on unconverted paths, the
  * exact hazard upstream's gate documents. */
-#define DS4_GLM_COMPACT_CACHE_PACKED_READY 0
+#define DS4_GLM_COMPACT_CACHE_PACKED_READY 1
+
+/* Packed fp8 row: elems × e4m3 + one f32 per-row scale, padded to an
+ * 8-byte stride (512 → 520 B, 64 → 72 B). Must match glm_fp8_row_stride
+ * in the CUDA backend. */
+static DS4_MAYBE_UNUSED uint64_t glm_graph_compact_packed_row_bytes(uint64_t elems) {
+    return (elems + 4u + 7u) & ~(uint64_t)7u;
+}
+
 static uint32_t glm_graph_compact_cache_format(void) {
 #if DS4_GLM_COMPACT_CACHE_PACKED_READY
-    if (getenv("DS4_GLM_FP8_KV_STORE") != NULL &&
-        glm_graph_compact_cache_is_f16()) {
-        return 2u;
+    static int fmt_cached = -1;
+    if (fmt_cached < 0) {
+        uint32_t fmt = glm_graph_compact_cache_is_f16() ? 1u : 0u;
+        if (fmt == 1u && getenv("DS4_GLM_FP8_KV_STORE") != NULL) {
+            if (ds4_gpu_glm_compact_cache_fp8_supported()) {
+                fmt = 2u;
+                fprintf(stderr, "ds4: GLM compact KV cache: packed fp8 rows "
+                        "(e4m3 + per-row f32 scale, experimental)\n");
+            } else {
+                fprintf(stderr, "ds4: DS4_GLM_FP8_KV_STORE ignored: backend "
+                        "lacks packed fp8 cache support\n");
+            }
+        }
+        ds4_gpu_set_glm_compact_cache_format(fmt);
+        fmt_cached = (int)fmt;
     }
-#endif
+    return (uint32_t)fmt_cached;
+#else
     return glm_graph_compact_cache_is_f16() ? 1u : 0u;
+#endif
 }
 
 static uint64_t glm_graph_compact_cache_elem_bytes(void) {
@@ -39914,11 +39936,15 @@ static bool glm_graph_alloc_slice(
     const uint64_t value_cache_bytes = g->full_kv_cache ?
         (uint64_t)g->ctx_cap * g->heads_dim * full_kv_elem_bytes : 0;
     const uint64_t compact_kv_lora_bytes =
-        (uint64_t)g->compact_cache_cap * DS4_N_KV_LORA *
-        glm_graph_compact_cache_elem_bytes();
+        (uint64_t)g->compact_cache_cap *
+        (glm_graph_compact_cache_format() == 2u ?
+             glm_graph_compact_packed_row_bytes(DS4_N_KV_LORA) :
+             DS4_N_KV_LORA * glm_graph_compact_cache_elem_bytes());
     const uint64_t compact_k_rope_bytes =
-        (uint64_t)g->compact_cache_cap * DS4_N_ROT *
-        glm_graph_compact_cache_elem_bytes();
+        (uint64_t)g->compact_cache_cap *
+        (glm_graph_compact_cache_format() == 2u ?
+             glm_graph_compact_packed_row_bytes(DS4_N_ROT) :
+             DS4_N_ROT * glm_graph_compact_cache_elem_bytes());
     const uint64_t compact_indexer_key_bytes =
         (uint64_t)g->compact_cache_cap * DS4_N_INDEXER_HEAD_DIM *
         glm_graph_compact_cache_elem_bytes();
@@ -39978,7 +40004,8 @@ static bool glm_graph_alloc_slice(
                 g->ctx_size,
                 g->layer_count,
                 g->indexer_full_layers,
-                glm_graph_compact_cache_is_f16() ? "f16" : "f32",
+                glm_graph_compact_cache_format() == 2u ? "fp8" :
+                    (glm_graph_compact_cache_is_f16() ? "f16" : "f32"),
                 compact_gib);
         fprintf(stderr,
                 "ds4: GLM compact indexed prefill chunk=%u score_rows=%u score_scratch=%.2f MiB\n",
@@ -43804,17 +43831,39 @@ static bool glm_graph_verify_rows(
                                                                DS4_N_KV_LORA,
                                                                (uint32_t)g->q_nope,
                                                                DS4_N_KEY_MLA) != 0;
+        const ds4_gpu_tensor *att_lora_cache = g->layer_kv_lora_cache[il];
+        const ds4_gpu_tensor *att_rope_cache = g->layer_k_rope_cache[il];
+        uint32_t att_cache_cap = g->compact_cache_cap;
+        bool att_cache_f16 = glm_graph_compact_cache_is_f16();
+        if (ok && glm_graph_compact_cache_format() == 2u) {
+            ds4_gpu_tensor *stage_lora = NULL, *stage_rope = NULL;
+            ok = ds4_gpu_glm_compact_fp8_stage_unpack(att_lora_cache,
+                                                      att_rope_cache,
+                                                      pos + n,
+                                                      DS4_N_KV_LORA,
+                                                      DS4_N_ROT,
+                                                      &stage_lora,
+                                                      &stage_rope) != 0;
+            if (ok) {
+                att_lora_cache = stage_lora;
+                att_rope_cache = stage_rope;
+                att_cache_cap = pos + n;
+                att_cache_f16 = true;
+            } else {
+                fprintf(stderr, "ds4: GLM batch fp8 stage unpack failed at layer %u\n", il);
+            }
+        }
         if (ok) ok = ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
                 g->batch_attn_lora,
                 g->batch_q,
                 g->batch_qk_low,
-                g->layer_kv_lora_cache[il],
-                g->layer_k_rope_cache[il],
+                att_lora_cache,
+                att_rope_cache,
                 n,
                 pos,
                 pos + n,
-                g->compact_cache_cap,
-                glm_graph_compact_cache_is_f16(),
+                att_cache_cap,
+                att_cache_f16,
                 DS4_N_HEAD,
                 DS4_N_KV_LORA,
                 (uint32_t)g->q_nope,
@@ -45546,6 +45595,28 @@ static bool glm_graph_forward_indexed_tokens(
         if (use_batch_attn_kernel) {
             const uint32_t attn_slice_cap =
                 glm_graph_indexed_prefill_batch_attn_slice_tokens();
+            const ds4_gpu_tensor *att_lora_cache = g->layer_kv_lora_cache[il];
+            const ds4_gpu_tensor *att_rope_cache = g->layer_k_rope_cache[il];
+            uint32_t att_cache_cap = g->compact_cache_cap;
+            bool att_cache_f16 = glm_graph_compact_cache_is_f16();
+            if (ok && glm_graph_compact_cache_format() == 2u) {
+                ds4_gpu_tensor *stage_lora = NULL, *stage_rope = NULL;
+                ok = ds4_gpu_glm_compact_fp8_stage_unpack(att_lora_cache,
+                                                          att_rope_cache,
+                                                          pos0 + n_tokens,
+                                                          DS4_N_KV_LORA,
+                                                          DS4_N_ROT,
+                                                          &stage_lora,
+                                                          &stage_rope) != 0;
+                if (ok) {
+                    att_lora_cache = stage_lora;
+                    att_rope_cache = stage_rope;
+                    att_cache_cap = pos0 + n_tokens;
+                    att_cache_f16 = true;
+                } else {
+                    fprintf(stderr, "ds4: GLM indexed prefill fp8 stage unpack failed at layer %u\n", il);
+                }
+            }
             for (uint32_t t0 = 0; ok && t0 < n_tokens; ) {
                 uint32_t slice = n_tokens - t0;
                 if (slice > attn_slice_cap) slice = attn_slice_cap;
@@ -45583,13 +45654,13 @@ static bool glm_graph_forward_indexed_tokens(
                                 attn_lora_view,
                                 q_view,
                                 qk_low_view,
-                                g->layer_kv_lora_cache[il],
-                                g->layer_k_rope_cache[il],
+                                att_lora_cache,
+                                att_rope_cache,
                                 slice,
                                 pos0 + t0,
                                 last_indexer_selected_count,
-                                g->compact_cache_cap,
-                                glm_graph_compact_cache_is_f16(),
+                                att_cache_cap,
+                                att_cache_f16,
                                 DS4_N_HEAD,
                                 DS4_N_KV_LORA,
                                 (uint32_t)g->q_nope,
@@ -45606,13 +45677,13 @@ static bool glm_graph_forward_indexed_tokens(
                                 attn_lora_view,
                                 q_view,
                                 qk_low_view,
-                                g->layer_kv_lora_cache[il],
-                                g->layer_k_rope_cache[il],
+                                att_lora_cache,
+                                att_rope_cache,
                                 selected_view,
                                 slice,
                                 last_indexer_selected_count,
-                                g->compact_cache_cap,
-                                glm_graph_compact_cache_is_f16(),
+                                att_cache_cap,
+                                att_cache_f16,
                                 DS4_N_HEAD,
                                 DS4_N_KV_LORA,
                                 (uint32_t)g->q_nope,
@@ -45662,8 +45733,8 @@ static bool glm_graph_forward_indexed_tokens(
                     int rc = ds4_gpu_glm_attention_indexed_batch_typed_tensor(heads_view,
                                                                               q_view,
                                                                               qk_low_view,
-                                                                              g->layer_kv_lora_cache[il],
-                                                                              g->layer_k_rope_cache[il],
+                                                                              att_lora_cache,
+                                                                              att_rope_cache,
                                                                               model->map,
                                                                               model->size,
                                                                               l->attn_v_b->abs_offset,
@@ -45671,8 +45742,8 @@ static bool glm_graph_forward_indexed_tokens(
                                                                               selected_view,
                                                                               slice,
                                                                               last_indexer_selected_count,
-                                                                              g->compact_cache_cap,
-                                                                              glm_graph_compact_cache_is_f16(),
+                                                                              att_cache_cap,
+                                                                              att_cache_f16,
                                                                               DS4_N_HEAD,
                                                                               DS4_N_KV_LORA,
                                                                               (uint32_t)g->q_nope,
@@ -46620,6 +46691,7 @@ static bool glm_graph_forward_token(
         }
         const bool fuse_qkv_norm_store = use_indexed_attention &&
                                          !decode_stage_profile &&
+                                         glm_graph_compact_cache_format() != 2u &&
                                          g->compact_cache_cap != 0;
         const bool fuse_qkv_norm = !decode_stage_profile && !fuse_qkv_norm_store;
         if (ok && fuse_qkv_norm_store) {
@@ -49530,6 +49602,11 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
 static int payload_write_glm_compact_span(FILE *fp, const ds4_gpu_tensor *tensor,
                                           uint64_t count, uint8_t *buf, size_t cap,
                                           char *err, size_t errlen) {
+    if (glm_graph_compact_cache_format() == 2u) {
+        payload_set_err(err, errlen, "session save requires the f16/f32 compact "
+                        "cache (packed fp8 rows are not serializable yet)");
+        return 1;
+    }
     if (glm_graph_compact_cache_is_f16()) {
         return payload_write_tensor_span_f16_as_f32(fp, tensor, 0, count, buf, cap, err, errlen);
     }
@@ -49539,6 +49616,11 @@ static int payload_write_glm_compact_span(FILE *fp, const ds4_gpu_tensor *tensor
 static int payload_read_glm_compact_span(FILE *fp, ds4_gpu_tensor *tensor,
                                          uint64_t count, uint8_t *buf, size_t cap,
                                          uint64_t *remaining, char *err, size_t errlen) {
+    if (glm_graph_compact_cache_format() == 2u) {
+        payload_set_err(err, errlen, "session restore requires the f16/f32 compact "
+                        "cache (packed fp8 rows are not serializable yet)");
+        return 1;
+    }
     if (glm_graph_compact_cache_is_f16()) {
         return payload_read_tensor_span_f32_as_f16(fp, tensor, 0, count, buf, cap, remaining, err, errlen);
     }
