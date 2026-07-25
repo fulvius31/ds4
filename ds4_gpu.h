@@ -163,7 +163,6 @@ int ds4_gpu_device_cache_support_tensors(int device_id,
 uint64_t ds4_gpu_tier_free_vram(int logical_tier);
 int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
                          int *out_device_id, void **out_device_ptr);
-int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t bytes);
 
 int ds4_gpu_pro_q4_expert_table_auto_available(void);
 int ds4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
@@ -1956,22 +1955,6 @@ int ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
-int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
-        ds4_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        const ds4_gpu_tensor *comp_mask,
-        uint32_t                n_tokens,
-        uint32_t                n_comp,
-        uint32_t                window,
-        uint32_t                ratio,
-        uint32_t                n_head,
-        uint32_t                head_dim);
 
 int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,
@@ -2280,7 +2263,6 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         uint32_t                mid_token_stride);
 
 int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
-void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);
 
 int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
         ds4_gpu_tensor       *out_hc,

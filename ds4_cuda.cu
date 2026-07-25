@@ -4682,11 +4682,6 @@ extern "C" int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
     return 0;
 }
 
-extern "C" int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t bytes) {
-    int d = -1;
-    if (!ds4_gpu_lookup_cache(source_offset, bytes, &d, NULL)) return -1;
-    return d;
-}
 
 /* Strict per-device selective-cache lookup.
  *
@@ -18548,27 +18543,6 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
                                        n_comp, window, ratio, n_head, head_dim);
 }
 
-extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
-        ds4_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        const ds4_gpu_tensor *comp_mask,
-        uint32_t                n_tokens,
-        uint32_t                n_comp,
-        uint32_t                window,
-        uint32_t                ratio,
-        uint32_t                n_head,
-        uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
-    return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
-                                       q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
-                                       n_comp, window, ratio, n_head, head_dim);
-}
 extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -31548,9 +31522,6 @@ extern "C" void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
     (void)enabled;   /* SSD streaming is not used on the CUDA backend */
 }
 
-extern "C" void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
-    g_glm_mtp_verify_mode = enabled;
-}
 
 extern "C" int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;

@@ -26741,71 +26741,6 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
                                                                        head_dim);
 }
 
-int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
-        ds4_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
-        const ds4_gpu_tensor *comp_mask,
-        uint32_t                n_tokens,
-        uint32_t                n_comp,
-        uint32_t                window,
-        uint32_t                ratio,
-        uint32_t                n_head,
-        uint32_t                head_dim) {
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!heads || !q || !raw_kv || !comp_kv || !comp_mask || !model_map ||
-        n_tokens == 0 || n_comp == 0 || ratio == 0) {
-        return 0;
-    }
-
-    @autoreleasepool {
-        if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
-            fprintf(stderr, "ds4: Metal attention sinks range is outside the mapped model\n");
-            return 0;
-        }
-
-        uint64_t sinks_inner = 0;
-        id<MTLBuffer> sinks_buf = ds4_gpu_wrap_model_range(model_map, model_size,
-                                                             sinks_offset,
-                                                             (uint64_t)n_head * sizeof(float),
-                                                             &sinks_inner);
-        if (!sinks_buf) return 0;
-
-        int owned = 0;
-        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
-        if (!cb) return 0;
-
-        if (!ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec(&cb,
-                                                                                heads,
-                                                                                sinks_buf,
-                                                                                (NSUInteger)sinks_inner,
-                                                                                q,
-                                                                                raw_kv,
-                                                                                comp_kv,
-                                                                                comp_kv_f16,
-                                                                                comp_mask,
-                                                                                1,
-                                                                                0,
-                                                                                n_tokens,
-                                                                                n_tokens,
-                                                                                n_comp,
-                                                                                window,
-                                                                                ratio,
-                                                                                n_head,
-                                                                                head_dim)) {
-            return 0;
-        }
-
-        if (!ds4_gpu_finish_command_buffer(cb, owned, "graph prefill masked mixed attention heads")) return 0;
-    }
-
-    return 1;
-}
 
 int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -40604,6 +40539,3 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
     return 1;
 }
 
-void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
-    (void)enabled;
-}
