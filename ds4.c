@@ -64882,6 +64882,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0 &&
             s->glm_graph_ready) {
             if (ds4_session_tp_leader(s)) {
+                /* One mirrored eval frame per cycle: the worker runs the
+                 * same deterministic spec cycle off it (seed or verify,
+                 * confidence gate included — DS4_GLM_MTP_CONF must match
+                 * on both ranks), so gate traffic stays in lockstep. */
                 ds4_engine *ge = s->engine;
                 if (!ds4_tp_send_eval(ge->tp.ctx, s->tp_session_id,
                                       ++ge->tp.eval_seq, first_token)) {

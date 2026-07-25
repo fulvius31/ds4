@@ -13,4 +13,4 @@ exec ./ds4 -m "$MODEL" --cuda \
   --role worker \
   --layers 40:output \
   -c "${GLM_CTX:-12288}" \
-  --coordinator 10.0.0.1 9911
+  --coordinator 10.0.0.1 9911 "$@"
