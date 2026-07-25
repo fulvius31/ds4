@@ -39955,6 +39955,50 @@ static int glm_graph_routed_moe_batch_dispatch(
     glm_debug_log_selected(il, selected, n_tokens);
     g->batch_routed_mid_is_f16 = false;
 
+    /* Span-sized batches (MTP verifies, tiny turn prefills): the per-token
+     * decode dispatch (direct pool reads, LUT dots) beats the prefill
+     * per-pair batch kernels ~1.7x per token at n<=4 (measured: layer-20
+     * routed_moe 0.77 ms at n=1 vs 2.59 ms at n=2), and under SSD streaming
+     * it reads the hot expert pool instead of re-staging every selection.
+     * TP stays on the owned-split batch path. */
+    if (n_tokens <= 4u && g->tp_world != 2 && selected && weights && x &&
+        out && mid && mid_token_stride != 0 &&
+        getenv("DS4_GLM_NO_SPAN_MOE_LOOP") == NULL) {
+        const uint64_t emb_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+        const uint64_t sel_bytes =
+            (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t);
+        const uint64_t w_bytes = (uint64_t)DS4_N_EXPERT_USED * sizeof(float);
+        const uint64_t mid_bytes =
+            (uint64_t)mid_token_stride * sizeof(float);
+        int ok_loop = 1;
+        for (uint32_t t = 0; ok_loop && t < n_tokens; t++) {
+            ds4_gpu_tensor *sel_v = ds4_gpu_tensor_view(
+                (ds4_gpu_tensor *)selected, (uint64_t)t * sel_bytes, sel_bytes);
+            ds4_gpu_tensor *w_v = ds4_gpu_tensor_view(
+                (ds4_gpu_tensor *)weights, (uint64_t)t * w_bytes, w_bytes);
+            ds4_gpu_tensor *x_v = ds4_gpu_tensor_view(
+                (ds4_gpu_tensor *)x, (uint64_t)t * emb_bytes, emb_bytes);
+            ds4_gpu_tensor *out_v = ds4_gpu_tensor_view(
+                out, (uint64_t)t * emb_bytes, emb_bytes);
+            ds4_gpu_tensor *mid_v = ds4_gpu_tensor_view(
+                mid, (uint64_t)t * mid_bytes, mid_bytes);
+            ok_loop = sel_v && w_v && x_v && out_v && mid_v &&
+                      glm_graph_routed_moe_one_dispatch(
+                          g, model, l, il, out_v, mid_v,
+                          gate_expert_bytes, gate_row_bytes,
+                          up_expert_bytes, up_row_bytes,
+                          down_expert_bytes, down_row_bytes,
+                          sel_v, w_v, x_v, force_resident);
+            ds4_gpu_tensor_free(sel_v);
+            ds4_gpu_tensor_free(w_v);
+            ds4_gpu_tensor_free(x_v);
+            ds4_gpu_tensor_free(out_v);
+            ds4_gpu_tensor_free(mid_v);
+        }
+        if (ok_loop) return 1;
+        /* Fall through to the batch paths on any failure. */
+    }
+
     if (glm_graph_layer_uses_generic_routed_moe(l)) {
         if (!g->batch_routed_gate || !g->batch_routed_up || !g->batch_routed_down ||
             l->ffn_gate_exps->type != l->ffn_up_exps->type) {
@@ -42221,7 +42265,13 @@ static bool glm_graph_encode_ffn_batch(
     if (ok) ok = glm_graph_capture_prefill_seed_router_selected(g,
                                                                 il,
                                                                 n_tokens);
-    if (ok) ok = glm_graph_seed_streaming_expert_cache_from_full_layer(
+    /* Span-sized batches take the per-token pool-read dispatch below —
+     * pre-staging the batch's expert selections would be pure overhead
+     * (it was ~2.9 s per 2-token verify under streaming). */
+    const bool span_moe_loop = n_tokens <= 4u && g->tp_world != 2 &&
+        getenv("DS4_GLM_NO_SPAN_MOE_LOOP") == NULL;
+    if (ok && !span_moe_loop) {
+        ok = glm_graph_seed_streaming_expert_cache_from_full_layer(
             g,
             model,
             weights,
@@ -42231,6 +42281,7 @@ static bool glm_graph_encode_ffn_batch(
             gate_out * gate_row_bytes,
             down_out * down_row_bytes,
             full_layer_prefill);
+    }
     bool shared_done = false;
 #define DS4_GLM_ENCODE_FFN_BATCH_SHARED() do { \
         if (ok) { \
