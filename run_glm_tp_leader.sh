@@ -10,7 +10,7 @@ export DS4_GLM_TP_ATTN_SPLIT=1
 export DS4_GLM_TP_SHARED_SPLIT=1
 export DS4_CUDA_WEIGHT_CACHE=1
 export DS4_GLM_CUDA_STREAMING=1
-export DS4_GLM_MEMORY_GUARD_RESERVE_GB=12
+export DS4_GLM_MEMORY_GUARD_RESERVE_GB="${DS4_GLM_MEMORY_GUARD_RESERVE_GB:-12}"
 # The RoCE v2 IPv4 GID index moves across reboots/docker network changes —
 # discover it at launch (falls back to the historical index 3).
 GID_DIR=/sys/class/infiniband/rocep1s0f0/ports/1

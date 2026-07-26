@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_tp.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -12,6 +13,15 @@
  * session worker. A model coordinator batches decode-ready sessions and
  * serializes bounded prefill quanta, keeping graph mutations out of client
  * threads while preserving per-session KV ownership. */
+
+/* Tensor-parallel leader transport. Bound to the engine before the listener
+ * starts and held for the process lifetime, then released in
+ * server_close_resources() *after* the engine is closed -- engine teardown can
+ * still drive gates, and freeing the transport first would pull it out from
+ * under that. NULL whenever TP is not in use, which is also how the request
+ * path tests "are we running tensor-parallel?". Declared here rather than next
+ * to its owner because server_session_sync() needs it and sits earlier. */
+static ds4_tp *g_tp_leader = NULL;
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -10317,6 +10327,12 @@ static int server_session_sync(server *s, server_slot *slot,
     if (!s || !slot || !prompt) return 1;
     if (!s->batched_mode) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        /* NOTE (2026-07-26): replacing the session here instead of letting
+         * ds4_session_sync() rewind was tried as a TP workaround and does NOT
+         * help -- a forced-fresh session still dies on the second large
+         * prefill. The stale state is in the TP bulk transport, not the
+         * session: large->small->large succeeds while large->large fails, and a
+         * small request never uses the bulk path. See run_glm_server_tp.sh. */
         int rc = ds4_session_sync(slot->session, prompt, err, errlen);
         server_prefill_leave(s);
         return rc;
@@ -12337,10 +12353,25 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
         max_completion);
 }
 
+/* Display name for a model id. The -chat/-reasoner aliases are the same
+ * weights and the same session -- they only preset the thinking mode -- so
+ * without a distinguishing name every alias advertises the engine's name and
+ * a picker (Open WebUI reads this field) shows two or three entries that look
+ * identical. Say which is which, since that is the only difference. */
 static void append_model_json(buf *b, const server *s, const char *id) {
+    const char *engine_name = ds4_engine_model_name(s->engine);
+    char labelled[192];
+    const char *name = engine_name;
+    if (model_alias_disables_thinking(id)) {
+        snprintf(labelled, sizeof(labelled), "%s (no thinking - fast)", engine_name);
+        name = labelled;
+    } else if (model_alias_enables_thinking(id)) {
+        snprintf(labelled, sizeof(labelled), "%s (thinking - slow, deeper)", engine_name);
+        name = labelled;
+    }
     append_model_json_values(b,
                              id,
-                             ds4_engine_model_name(s->engine),
+                             name,
                              s->ctx_size,
                              s->default_tokens);
 }
@@ -12635,6 +12666,10 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
     ds4_engine_close(s->engine);
+    if (g_tp_leader) {
+        ds4_tp_free(g_tp_leader);
+        g_tp_leader = NULL;
+    }
     memset(s, 0, sizeof(*s));
 }
 
@@ -12710,6 +12745,23 @@ static server_config parse_options(int argc, char **argv) {
             exit(2);
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg,
+                                 &i,
+                                 argc,
+                                 argv,
+                                 &c.engine.tp,
+                                 tp_parse_err,
+                                 sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: %s",
+                       tp_parse_err[0] ? tp_parse_err : "invalid tensor-parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
@@ -12867,12 +12919,29 @@ static server_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
+    /* Under TP the pairing is described with the same --role/--listen/
+     * --coordinator flags as pipeline mode, but they belong to the TP
+     * transport rather than the layer-split distributed one. adopt() moves
+     * them across and leaves distributed at ROLE_NONE; without it the
+     * distributed validator rejects the launch with "--role coordinator
+     * requires --layers", which a TP leader never passes. Order matters:
+     * adopt, then prepare, then validate the combination. */
+    char tp_err[256];
+    if (!ds4_tp_adopt_distributed_options(&c.engine.tp, &c.engine.distributed,
+                                          tp_err, sizeof(tp_err))) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
                                         dist_err,
                                         sizeof(dist_err)) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
+        exit(2);
+    }
+    if (!ds4_tp_validate_engine_options(&c.engine, tp_err, sizeof(tp_err))) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
         exit(2);
     }
     return c;
@@ -12952,6 +13021,45 @@ int main(int argc, char **argv) {
         int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
         ds4_engine_close(engine);
         return rc;
+    }
+
+    /* Tensor-parallel roles, mirroring the CLI. A TP worker never serves HTTP:
+     * it runs the lockstep gate loop against the leader and exits with it, so
+     * it must be handled before any listener is created. The leader binds the
+     * transport to the engine up front; every later session inherits it. */
+    if (cfg.engine.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
+        ds4_engine_close(engine);
+        return rc;
+    }
+    if (cfg.engine.tp.role == DS4_TP_LEADER) {
+        char tp_err[256] = "";
+        ds4_tp_identity tp_id = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = (uint32_t)cfg.ctx_size,
+        };
+        /* The gate schedule is part of the identity handshake: the worker
+         * refuses the pairing unless its own schedule matches exactly, which
+         * is what catches a rank started with different split envs. */
+        ds4_engine_tp_gate_schedule(engine,
+                                    &tp_id.gate_slot_start,
+                                    &tp_id.gate_slot_step,
+                                    &tp_id.gates_per_token);
+        if (!ds4_tp_create(&g_tp_leader, &cfg.engine.tp, &tp_id,
+                           tp_err, sizeof(tp_err)) ||
+            !ds4_engine_tp_bind(engine, g_tp_leader, tp_err, sizeof(tp_err))) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: %s",
+                       tp_err[0] ? tp_err : "tensor-parallel setup failed");
+            ds4_tp_free(g_tp_leader);
+            g_tp_leader = NULL;
+            ds4_engine_close(engine);
+            return 1;
+        }
     }
 
     const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
