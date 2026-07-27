@@ -44,7 +44,7 @@ sleep 4
 
 echo "== leader + API (:$PORT) =="
 DS4_GLM_MEMORY_GUARD_RESERVE_GB=$RESERVE GLM_CTX=$CTX GLM_PORT=$PORT \
-  setsid nohup ./run_glm_server_pipeline.sh > ~/logs_ds4_tests/glm_1M_server.log 2>&1 < /dev/null &
+  setsid nohup ./run_glm_server.sh > ~/logs_ds4_tests/glm_1M_server.log 2>&1 < /dev/null &
 disown
 
 for i in $(seq 1 90); do
