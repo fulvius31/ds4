@@ -430,6 +430,17 @@ static void cuda_fetch_readahead(const void *model_map, uint64_t model_size,
                                  const cuda_fetch_job *jobs, uint32_t n) {
     if (!model_map || n == 0 || getenv("DS4_CUDA_NO_FETCH_READAHEAD"))
         return;
+#if defined(__linux__) && defined(O_DIRECT)
+    /* When the staging reads go through the O_DIRECT fd they bypass the page
+     * cache entirely, so every page this hint pulls in is fetched a second
+     * time by the real read and then never used: measured exactly 2x the
+     * physical I/O of what was requested (341.9 GiB read for 169.9 GiB of
+     * experts on a 4060-token prefill). Skipping the hint on that path drops
+     * reads to 172.9 GiB -- 1.02x -- and prefill from 159.2s to 108.1s.
+     * The hint still earns its keep when direct IO is unavailable and
+     * cuda_model_stage_read() falls back to a buffered pread. */
+    if (g_model_direct_fd >= 0 && g_model_direct_align > 1) return;
+#endif
     const long page_l = sysconf(_SC_PAGESIZE);
     const uint64_t page = page_l > 0 ? (uint64_t)page_l : 4096u;
     for (uint32_t i = 0; i < n; i++) {
@@ -26843,6 +26854,44 @@ static int cuda_stream_selected_cache_begin_load(
                 cuda_stream_selected_cache_invalidate();
                 return 0;
             }
+        }
+    }
+    /* Streaming load accounting (DS4_CUDA_STREAM_LOAD_STATS=1): how many
+     * times each layer is asked to stage experts and how many of those
+     * requests actually reach the disk. Prefill reads far more than the
+     * layer's whole expert set is worth, and calls-per-layer is the only
+     * thing that distinguishes "one sweep re-reading" from "several
+     * sweeps". Counters are per process and printed every 256 calls. */
+    if (getenv("DS4_CUDA_STREAM_LOAD_STATS") != NULL) {
+        static uint64_t s_calls, s_experts, s_missing, s_bytes_missing;
+        static uint64_t s_calls_by_layer[128];
+        s_calls++;
+        s_experts += (uint64_t)compact_ids.size();
+        uint64_t miss_here = 0;
+        for (uint32_t i = 0; i < compact_ids.size(); i++)
+            if (!pool_hit[i]) miss_here++;
+        s_missing += miss_here;
+        s_bytes_missing += miss_here * (2ull * table->gate_expert_bytes +
+                                        table->down_expert_bytes);
+        if (table->layer < 128u) s_calls_by_layer[table->layer]++;
+        if (s_calls % 16u == 0) {
+            uint32_t layers_seen = 0, max_calls = 0;
+            for (uint32_t i = 0; i < 128u; i++) {
+                if (s_calls_by_layer[i]) layers_seen++;
+                if (s_calls_by_layer[i] > max_calls)
+                    max_calls = (uint32_t)s_calls_by_layer[i];
+            }
+            fprintf(stderr,
+                    "ds4: CUDA stream load: calls=%llu experts=%llu "
+                    "missing=%llu (%.1f%%) miss_bytes=%.1f GiB "
+                    "layers=%u max_calls/layer=%u pool_ok=%d slots_last=%u compact_last=%u layer_last=%u\n",
+                    (unsigned long long)s_calls,
+                    (unsigned long long)s_experts,
+                    (unsigned long long)s_missing,
+                    s_experts ? 100.0 * (double)s_missing / (double)s_experts : 0.0,
+                    (double)s_bytes_missing / 1073741824.0,
+                    layers_seen, max_calls, pool_ok, slot_count,
+                    (uint32_t)compact_ids.size(), table->layer);
         }
     }
     if (pool_ok && getenv("DS4_CUDA_EXPERT_POOL_STATS") != NULL) {
