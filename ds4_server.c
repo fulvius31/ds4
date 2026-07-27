@@ -12459,10 +12459,25 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
         max_completion);
 }
 
+/* Display name for a model id. The -chat/-reasoner aliases are the same
+ * weights and the same session -- they only preset the thinking mode -- so
+ * without a distinguishing name every alias advertises the engine's name and
+ * a picker (Open WebUI reads this field) shows two or three entries that look
+ * identical. Say which is which, since that is the only difference. */
 static void append_model_json(buf *b, const server *s, const char *id) {
+    const char *engine_name = ds4_engine_model_name(s->engine);
+    char labelled[192];
+    const char *name = engine_name;
+    if (model_alias_disables_thinking(id)) {
+        snprintf(labelled, sizeof(labelled), "%s (no thinking - fast)", engine_name);
+        name = labelled;
+    } else if (model_alias_enables_thinking(id)) {
+        snprintf(labelled, sizeof(labelled), "%s (thinking - slow, deeper)", engine_name);
+        name = labelled;
+    }
     append_model_json_values(b,
                              id,
-                             ds4_engine_model_name(s->engine),
+                             name,
                              s->ctx_size,
                              s->default_tokens);
 }
