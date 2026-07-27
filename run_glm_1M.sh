@@ -41,13 +41,17 @@ echo "== worker first (10.0.0.2, layers 40:output, ctx $CTX) =="
 # before the leader is listening. (TP is the opposite -- leader first.)
 # Forwarded so both ranks run the same streaming config; the worker's env is
 # built inline here and does not inherit this shell's exports.
-# Parallel expert reads: measured 2026-07-26 on the identical 4060-token cold
-# prefill, +30% prefill (201.6s -> 154.9s) and +40% read bandwidth (1587 ->
-# 2252 MiB/s); greedy output byte-identical with it off. 16 threads beat 8
-# marginally and 30 regressed (oversubscription). Export so the leader gets it
-# too -- the worker's env is built inline below, the leader's is inherited.
+# Parallel expert reads. Cumulative on the identical 4060-token cold prefill
+# (2026-07-26): 201.6s -> 154.9s with the pread pool, -> 107.8s once the
+# redundant madvise readahead was skipped on the O_DIRECT path, -> 99.1s with
+# double-buffered banks. 20.1 -> 41.0 t/s, a 2.03x speedup on half the disk
+# traffic; greedy output byte-identical throughout.
+# 8 threads, NOT 16: before double-buffering 16 won marginally, but once reads
+# overlap uploads the extra threads only add contention (99.1s at 8, 102.5s at
+# 16, 102.6s at 24). Export so the leader gets it too -- the worker's env is
+# built inline below, the leader's is inherited.
 PREAD="${DS4_CUDA_PREAD_POOL:-1}"
-PREAD_T="${DS4_CUDA_PREAD_POOL_THREADS:-16}"
+PREAD_T="${DS4_CUDA_PREAD_POOL_THREADS:-8}"
 export DS4_CUDA_PREAD_POOL="$PREAD" DS4_CUDA_PREAD_POOL_THREADS="$PREAD_T"
 PREFILL_INSERT="${DS4_CUDA_POOL_PREFILL_INSERT:-}"
 NO_RA="${DS4_CUDA_NO_FETCH_READAHEAD:-}"
