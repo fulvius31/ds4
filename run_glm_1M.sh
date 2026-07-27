@@ -55,7 +55,11 @@ PREAD_T="${DS4_CUDA_PREAD_POOL_THREADS:-8}"
 export DS4_CUDA_PREAD_POOL="$PREAD" DS4_CUDA_PREAD_POOL_THREADS="$PREAD_T"
 PREFILL_INSERT="${DS4_CUDA_POOL_PREFILL_INSERT:-}"
 NO_RA="${DS4_CUDA_NO_FETCH_READAHEAD:-}"
-timeout 30 ssh $R "cd ds4 && nohup bash -c '${NO_RA:+DS4_CUDA_NO_FETCH_READAHEAD=$NO_RA }${PREFILL_INSERT:+DS4_CUDA_POOL_PREFILL_INSERT=$PREFILL_INSERT }DS4_CUDA_PREAD_POOL=$PREAD DS4_CUDA_PREAD_POOL_THREADS=$PREAD_T DS4_GLM_MEMORY_GUARD_RESERVE_GB=$RESERVE DS4_GLM_FP8_KV_STORE=1 DS4_CUDA_WEIGHT_CACHE=1 DS4_GLM_CUDA_STREAMING=1 ./ds4 -m $MODEL --cuda --ssd-streaming --ssd-streaming-full-layers 0 --ssd-streaming-cache-experts ${POOL:-5000} --role worker --layers 40:output -c $CTX --coordinator 10.0.0.1 9911 > ~/logs_ds4_tests/glm_1M_worker.log 2>&1' < /dev/null > /dev/null 2>&1 &" >/dev/null 2>&1
+# Indexed prefill chunk. Expert reads scale with the NUMBER OF SWEEPS, not
+# with tokens -- a 2048-token span already selects ~every expert in a layer --
+# so this divides long-prompt disk traffic. Must match on all ranks.
+IDX_CHUNK="${DS4_GLM_INDEXED_PREFILL_CHUNK_TOKENS:-}"
+timeout 30 ssh $R "cd ds4 && nohup bash -c '${IDX_CHUNK:+DS4_GLM_INDEXED_PREFILL_CHUNK_TOKENS=$IDX_CHUNK }${NO_RA:+DS4_CUDA_NO_FETCH_READAHEAD=$NO_RA }${PREFILL_INSERT:+DS4_CUDA_POOL_PREFILL_INSERT=$PREFILL_INSERT }DS4_CUDA_PREAD_POOL=$PREAD DS4_CUDA_PREAD_POOL_THREADS=$PREAD_T DS4_GLM_MEMORY_GUARD_RESERVE_GB=$RESERVE DS4_GLM_FP8_KV_STORE=1 DS4_CUDA_WEIGHT_CACHE=1 DS4_GLM_CUDA_STREAMING=1 ./ds4 -m $MODEL --cuda --ssd-streaming --ssd-streaming-full-layers 0 --ssd-streaming-cache-experts ${POOL:-5000} --role worker --layers 40:output -c $CTX --coordinator 10.0.0.1 9911 > ~/logs_ds4_tests/glm_1M_worker.log 2>&1' < /dev/null > /dev/null 2>&1 &" >/dev/null 2>&1
 sleep 4
 
 echo "== leader + API (:$PORT) =="
