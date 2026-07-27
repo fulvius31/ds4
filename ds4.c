@@ -42328,6 +42328,19 @@ static bool glm_graph_disable_add3_residual(void);
  * a batch chunk must be staged or routed_moe_launch rejects the layer.
  * Mirrors metal_graph_cuda_stream_prefill_batch_selected_load, with the
  * GLM expert table (gate/up/down all present). */
+/* Which staging site fires per layer (DS4_GLM_STREAM_LOAD_TRACE=1). Prefill
+ * stages ~2x the layer's expert set and the two call sites are textually
+ * identical, so only a per-site tag distinguishes "one sweep re-reading"
+ * from "two sweeps". */
+static void glm_stream_load_trace(const char *site, uint32_t il,
+                                  uint32_t n_tokens) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_GLM_STREAM_LOAD_TRACE") != NULL ? 1 : 0;
+    if (!on) return;
+    fprintf(stderr, "ds4: stream-load site=%s layer=%u n_tokens=%u\n",
+            site, il, n_tokens);
+}
+
 static bool glm_graph_cuda_stream_prefill_batch_selected_load(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -42527,6 +42540,7 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
         ok = glm_graph_tp_batch_bounce_ready(g, n_tokens);
     }
     if (ok) {
+        glm_stream_load_trace("sparse_indexed_moe", il, n_tokens);
         ok = glm_graph_cuda_stream_prefill_batch_selected_load(
                 g,
                 model,
@@ -43133,6 +43147,7 @@ static bool glm_graph_encode_ffn_batch(
     }
 #endif
     if (ok) {
+        glm_stream_load_trace("ffn_batch", il, n_tokens);
         ok = glm_graph_cuda_stream_prefill_batch_selected_load(
                 g,
                 model,
