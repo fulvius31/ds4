@@ -39,7 +39,17 @@ timeout 25 ssh $R 'for i in 1 2 3; do pkill -9 -x ds4 2>/dev/null; sleep 1; [ "$
 echo "== worker first (10.0.0.2, layers 40:output, ctx $CTX) =="
 # Pipeline order: the worker dials the coordinator and retries, so it may start
 # before the leader is listening. (TP is the opposite -- leader first.)
-timeout 30 ssh $R "cd ds4 && nohup bash -c 'DS4_GLM_MEMORY_GUARD_RESERVE_GB=$RESERVE DS4_GLM_FP8_KV_STORE=1 DS4_CUDA_WEIGHT_CACHE=1 DS4_GLM_CUDA_STREAMING=1 ./ds4 -m $MODEL --cuda --ssd-streaming --ssd-streaming-full-layers 0 --ssd-streaming-cache-experts ${POOL:-5000} --role worker --layers 40:output -c $CTX --coordinator 10.0.0.1 9911 > ~/logs_ds4_tests/glm_1M_worker.log 2>&1' < /dev/null > /dev/null 2>&1 &" >/dev/null 2>&1
+# Forwarded so both ranks run the same streaming config; the worker's env is
+# built inline here and does not inherit this shell's exports.
+# Parallel expert reads: measured 2026-07-26 on the identical 4060-token cold
+# prefill, +30% prefill (201.6s -> 154.9s) and +40% read bandwidth (1587 ->
+# 2252 MiB/s); greedy output byte-identical with it off. 16 threads beat 8
+# marginally and 30 regressed (oversubscription). Export so the leader gets it
+# too -- the worker's env is built inline below, the leader's is inherited.
+PREAD="${DS4_CUDA_PREAD_POOL:-1}"
+PREAD_T="${DS4_CUDA_PREAD_POOL_THREADS:-16}"
+export DS4_CUDA_PREAD_POOL="$PREAD" DS4_CUDA_PREAD_POOL_THREADS="$PREAD_T"
+timeout 30 ssh $R "cd ds4 && nohup bash -c 'DS4_CUDA_PREAD_POOL=$PREAD DS4_CUDA_PREAD_POOL_THREADS=$PREAD_T DS4_GLM_MEMORY_GUARD_RESERVE_GB=$RESERVE DS4_GLM_FP8_KV_STORE=1 DS4_CUDA_WEIGHT_CACHE=1 DS4_GLM_CUDA_STREAMING=1 ./ds4 -m $MODEL --cuda --ssd-streaming --ssd-streaming-full-layers 0 --ssd-streaming-cache-experts ${POOL:-5000} --role worker --layers 40:output -c $CTX --coordinator 10.0.0.1 9911 > ~/logs_ds4_tests/glm_1M_worker.log 2>&1' < /dev/null > /dev/null 2>&1 &" >/dev/null 2>&1
 sleep 4
 
 echo "== leader + API (:$PORT) =="
