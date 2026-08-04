@@ -2447,6 +2447,178 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
     return cuda_pread_full(g_model_fd, stage, bytes, offset);
 }
 
+/* ---------------------------------------------------------------------
+ * Parallel expert pread pool (opt-in: DS4_CUDA_PREAD_POOL=1)
+ *
+ * The staged expert path issues one synchronous pread per tensor
+ * (gate/up/down) per selected expert, each interleaved with its own H2D
+ * submit, so the NVMe never sees more than one outstanding request.
+ * Measured on GB10 + local NVMe: 1.34 GiB/s sustained through this path,
+ * against 5.5 GiB/s the same device delivers for the identical 3-9 MiB
+ * random reads once several are in flight. Under --ssd-streaming both
+ * prefill and decode are bandwidth-bound on exactly that gap (a
+ * 4060-token prefill reads 177 GiB; 79 decoded tokens read 45.6 GiB).
+ *
+ * This pool runs every miss's reads concurrently into a pinned bank and
+ * only then submits the copies, so the device gets real queue depth. It
+ * mirrors the pread pool ds4_metal.m has always had; the CUDA side never
+ * got one because an earlier worker-pool attempt measured slower on a
+ * WARM page cache, where the reads are already nearly free. A working
+ * set this size on a box whose RAM is committed to KV and the expert
+ * pool is never warm, so that result does not carry over here.
+ * ------------------------------------------------------------------ */
+#define CUDA_PREAD_POOL_MAX_SLOTS   32u
+#define CUDA_PREAD_POOL_MAX_THREADS 32u
+
+typedef struct {
+    void       *stage;
+    uint64_t    stage_bytes;
+    uint64_t    offset;
+    uint64_t    bytes;
+    const char *payload;
+    int         ok;
+} cuda_pread_task;
+
+static pthread_mutex_t  g_pread_pool_mu    = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t   g_pread_pool_start = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t   g_pread_pool_done  = PTHREAD_COND_INITIALIZER;
+static pthread_t        g_pread_pool_threads[CUDA_PREAD_POOL_MAX_THREADS];
+static uint32_t         g_pread_pool_nthreads;
+static cuda_pread_task *g_pread_pool_tasks;
+static uint32_t         g_pread_pool_ntasks;
+static uint32_t         g_pread_pool_next;
+static uint32_t         g_pread_pool_busy;
+static uint64_t         g_pread_pool_generation;
+static int              g_pread_pool_stop;
+static int              g_pread_pool_ready;
+
+/* Pinned staging bank: one slot per concurrent read, so workers never
+ * share a buffer (cuda_model_stage_read is positional-pread based and
+ * touches only read-only globals on the success path). */
+static void        *g_pread_bank_raw[CUDA_PREAD_POOL_MAX_SLOTS];
+static void        *g_pread_bank[CUDA_PREAD_POOL_MAX_SLOTS];
+static uint64_t     g_pread_bank_bytes;
+static uint32_t     g_pread_bank_slots;
+static cudaStream_t g_pread_pool_stream;
+
+static int cuda_pread_pool_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_CUDA_PREAD_POOL");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+static void *cuda_pread_pool_worker(void *arg) {
+    (void)arg;
+    uint64_t seen = 0;
+    pthread_mutex_lock(&g_pread_pool_mu);
+    for (;;) {
+        while (!g_pread_pool_stop && g_pread_pool_generation == seen)
+            pthread_cond_wait(&g_pread_pool_start, &g_pread_pool_mu);
+        if (g_pread_pool_stop) break;
+        seen = g_pread_pool_generation;
+        for (;;) {
+            if (g_pread_pool_next >= g_pread_pool_ntasks) break;
+            cuda_pread_task *t = &g_pread_pool_tasks[g_pread_pool_next++];
+            pthread_mutex_unlock(&g_pread_pool_mu);
+            t->ok = cuda_model_stage_read(t->stage, t->stage_bytes,
+                                          t->offset, t->bytes, &t->payload);
+            pthread_mutex_lock(&g_pread_pool_mu);
+        }
+        if (g_pread_pool_busy > 0 && --g_pread_pool_busy == 0)
+            pthread_cond_signal(&g_pread_pool_done);
+    }
+    pthread_mutex_unlock(&g_pread_pool_mu);
+    return NULL;
+}
+
+static int cuda_pread_pool_init(void) {
+    if (g_pread_pool_ready) return 1;
+    uint32_t n = 8;
+    const char *e = getenv("DS4_CUDA_PREAD_POOL_THREADS");
+    if (e && e[0]) {
+        unsigned long v = strtoul(e, NULL, 10);
+        if (v >= 1 && v <= CUDA_PREAD_POOL_MAX_THREADS) n = (uint32_t)v;
+    }
+    pthread_mutex_lock(&g_pread_pool_mu);
+    if (g_pread_pool_ready) { pthread_mutex_unlock(&g_pread_pool_mu); return 1; }
+    for (uint32_t i = 0; i < n; i++) {
+        if (pthread_create(&g_pread_pool_threads[g_pread_pool_nthreads], NULL,
+                           cuda_pread_pool_worker, NULL) != 0)
+            break;
+        g_pread_pool_nthreads++;
+    }
+    g_pread_pool_ready = g_pread_pool_nthreads > 0;
+    const int ok = g_pread_pool_ready;
+    const uint32_t got = g_pread_pool_nthreads;
+    pthread_mutex_unlock(&g_pread_pool_mu);
+    if (ok)
+        fprintf(stderr, "ds4: CUDA expert pread pool: %u threads\n", got);
+    else
+        fprintf(stderr, "ds4: CUDA expert pread pool unavailable, "
+                        "falling back to serial reads\n");
+    return ok;
+}
+
+/* Grow the pinned bank to `slots` buffers each able to hold a
+ * direct-IO-aligned read of `slot_bytes`. Shrinks are no-ops. */
+static int cuda_pread_bank_alloc(uint64_t slot_bytes, uint32_t slots) {
+    if (slots > CUDA_PREAD_POOL_MAX_SLOTS) slots = CUDA_PREAD_POOL_MAX_SLOTS;
+    if (slots == 0 || slot_bytes == 0) return 0;
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 1;
+    const uint64_t usable = cuda_round_up(slot_bytes, align) + align;
+    const uint64_t alloc  = usable + align;
+    if (!g_pread_pool_stream &&
+        cudaStreamCreateWithFlags(&g_pread_pool_stream, cudaStreamNonBlocking)
+                != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_pread_pool_stream = NULL;
+        return 0;
+    }
+    if (g_pread_bank_slots >= slots && g_pread_bank_bytes >= usable) return 1;
+    for (uint32_t i = 0; i < g_pread_bank_slots; i++) {
+        if (g_pread_bank_raw[i]) (void)cudaFreeHost(g_pread_bank_raw[i]);
+        g_pread_bank_raw[i] = NULL;
+        g_pread_bank[i] = NULL;
+    }
+    g_pread_bank_slots = 0;
+    g_pread_bank_bytes = 0;
+    for (uint32_t i = 0; i < slots; i++) {
+        if (cudaMallocHost(&g_pread_bank_raw[i], (size_t)alloc) != cudaSuccess) {
+            (void)cudaGetLastError();
+            break;
+        }
+        g_pread_bank[i] = cuda_align_ptr(g_pread_bank_raw[i], align);
+        g_pread_bank_slots++;
+    }
+    if (g_pread_bank_slots == 0) return 0;
+    g_pread_bank_bytes = usable;
+    return 1;
+}
+
+/* Run every task concurrently; returns 1 only when all reads succeeded. */
+static int cuda_pread_pool_run(cuda_pread_task *tasks, uint32_t n) {
+    if (n == 0) return 1;
+    if (!cuda_pread_pool_init()) return 0;
+    pthread_mutex_lock(&g_pread_pool_mu);
+    g_pread_pool_tasks = tasks;
+    g_pread_pool_ntasks = n;
+    g_pread_pool_next = 0;
+    g_pread_pool_busy = g_pread_pool_nthreads;
+    g_pread_pool_generation++;
+    pthread_cond_broadcast(&g_pread_pool_start);
+    while (g_pread_pool_busy != 0)
+        pthread_cond_wait(&g_pread_pool_done, &g_pread_pool_mu);
+    g_pread_pool_tasks = NULL;
+    g_pread_pool_ntasks = 0;
+    pthread_mutex_unlock(&g_pread_pool_mu);
+    for (uint32_t i = 0; i < n; i++)
+        if (!tasks[i].ok) return 0;
+    return 1;
+}
+
 static void cuda_stream_selected_stage_release(void) {
     for (size_t i = 0; i < 4; i++) {
         if (g_stream_selected_stage_event[i]) {
@@ -26939,7 +27111,167 @@ static int cuda_stream_selected_cache_begin_load(
         cuda_fetch_readahead(table->model_map, table->model_size,
                              fetch_jobs.data(), (uint32_t)fetch_jobs.size());
     }
+    /* Parallel miss fill (DS4_CUDA_PREAD_POOL=1): read every missing
+     * expert's gate/up/down concurrently into the pinned bank, then submit
+     * the uploads together. Marks the entries hit so the serial loop below
+     * skips them; on any failure nothing is marked and that loop refills
+     * the expert exactly as before. */
+    if (pool_ok && cuda_pread_pool_enabled() && g_model_fd >= 0 &&
+        (g_model_fd_host_base == NULL ||
+         table->model_map == g_model_fd_host_base)) {
+        std::vector<uint32_t> miss_idx;
+        for (uint32_t i = 0; i < compact_ids.size(); i++) {
+            if (pool_slot[i] != UINT32_MAX && !pool_hit[i])
+                miss_idx.push_back(i);
+        }
+        const uint64_t slot_bytes =
+            table->gate_expert_bytes > table->down_expert_bytes ?
+            table->gate_expert_bytes : table->down_expert_bytes;
+        const uint32_t want = (uint32_t)miss_idx.size() * 3u;
+        if (!miss_idx.empty() && want <= CUDA_PREAD_POOL_MAX_SLOTS &&
+            cuda_pread_bank_alloc(slot_bytes, want)) {
+            std::vector<cuda_pread_task> tasks(want);
+            for (uint32_t m = 0; m < miss_idx.size(); m++) {
+                const uint64_t expert = (uint32_t)compact_ids[miss_idx[m]];
+                const uint64_t off[3] = {
+                    table->gate_offset + expert * table->gate_expert_bytes,
+                    table->up_offset   + expert * table->gate_expert_bytes,
+                    table->down_offset + expert * table->down_expert_bytes
+                };
+                const uint64_t len[3] = {
+                    table->gate_expert_bytes,
+                    table->gate_expert_bytes,
+                    table->down_expert_bytes
+                };
+                for (uint32_t k = 0; k < 3u; k++) {
+                    cuda_pread_task *t = &tasks[m * 3u + k];
+                    t->stage       = g_pread_bank[m * 3u + k];
+                    t->stage_bytes = g_pread_bank_bytes;
+                    t->offset      = off[k];
+                    t->bytes       = len[k];
+                    t->payload     = NULL;
+                    t->ok          = 0;
+                }
+            }
+            if (cuda_pread_pool_run(tasks.data(), want)) {
+                int all = 1;
+                for (uint32_t m = 0; m < miss_idx.size() && all; m++) {
+                    const uint32_t slot = pool_slot[miss_idx[m]];
+                    char *dst[3] = {
+                        cuda_expert_pool_ptr(g_expert_pool.gate_chunks, slot,
+                                             g_expert_pool.gate_bytes),
+                        cuda_expert_pool_ptr(g_expert_pool.up_chunks, slot,
+                                             g_expert_pool.gate_bytes),
+                        cuda_expert_pool_ptr(g_expert_pool.down_chunks, slot,
+                                             g_expert_pool.down_bytes)
+                    };
+                    for (uint32_t k = 0; k < 3u && all; k++) {
+                        const cuda_pread_task *t = &tasks[m * 3u + k];
+                        if (cudaMemcpyAsync(dst[k], t->payload,
+                                            (size_t)t->bytes,
+                                            cudaMemcpyHostToDevice,
+                                            g_pread_pool_stream)
+                                != cudaSuccess) {
+                            (void)cudaGetLastError();
+                            all = 0;
+                        }
+                    }
+                }
+                /* The bank is reused by the next call, so the uploads must
+                 * land before we return regardless of outcome. */
+                if (cudaStreamSynchronize(g_pread_pool_stream) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    all = 0;
+                }
+                if (all) {
+                    for (uint32_t m = 0; m < miss_idx.size(); m++)
+                        pool_hit[miss_idx[m]] = 1u;
+                }
+            }
+        }
+    }
+    /* Parallel gather fill for the NON-pool path, i.e. batch prefill: it
+     * sets pool_insert=0 to keep the decode working set off the LRU, so
+     * pool_ok is false and the block above never sees it -- yet prefill is
+     * where nearly all the streaming bytes are read (a 4060-token prompt
+     * moves 345 GiB on the leader alone). One chunk can select every
+     * expert in a layer, far past the bank, so walk it in waves: read a
+     * wave concurrently, submit its uploads, sync, mark it done. Entries
+     * filled here are skipped by the serial loop below; a failed wave
+     * simply stops the pre-pass and leaves the rest to it. */
+    std::vector<uint8_t> prefilled(compact_ids.size(), 0);
+    if (!pool_ok && cuda_pread_pool_enabled() && g_model_fd >= 0 &&
+        g_stream_selected_cache.gate_ptr && g_stream_selected_cache.up_ptr &&
+        g_stream_selected_cache.down_ptr &&
+        (g_model_fd_host_base == NULL ||
+         table->model_map == g_model_fd_host_base)) {
+        const uint32_t per_wave = CUDA_PREAD_POOL_MAX_SLOTS / 3u;
+        const uint64_t slot_bytes =
+            table->gate_expert_bytes > table->down_expert_bytes ?
+            table->gate_expert_bytes : table->down_expert_bytes;
+        if (per_wave > 0 && cuda_pread_bank_alloc(slot_bytes, per_wave * 3u)) {
+            std::vector<cuda_pread_task> tasks(per_wave * 3u);
+            const uint32_t n_ids = (uint32_t)compact_ids.size();
+            for (uint32_t base = 0; base < n_ids; base += per_wave) {
+                const uint32_t n = n_ids - base < per_wave ?
+                                   n_ids - base : per_wave;
+                for (uint32_t m = 0; m < n; m++) {
+                    const uint64_t expert = (uint32_t)compact_ids[base + m];
+                    const uint64_t off[3] = {
+                        table->gate_offset + expert * table->gate_expert_bytes,
+                        table->up_offset   + expert * table->gate_expert_bytes,
+                        table->down_offset + expert * table->down_expert_bytes
+                    };
+                    const uint64_t len[3] = {
+                        table->gate_expert_bytes,
+                        table->gate_expert_bytes,
+                        table->down_expert_bytes
+                    };
+                    for (uint32_t k = 0; k < 3u; k++) {
+                        cuda_pread_task *t = &tasks[m * 3u + k];
+                        t->stage       = g_pread_bank[m * 3u + k];
+                        t->stage_bytes = g_pread_bank_bytes;
+                        t->offset      = off[k];
+                        t->bytes       = len[k];
+                        t->payload     = NULL;
+                        t->ok          = 0;
+                    }
+                }
+                if (!cuda_pread_pool_run(tasks.data(), n * 3u)) break;
+                int all = 1;
+                for (uint32_t m = 0; m < n && all; m++) {
+                    const uint32_t i = base + m;
+                    char *dst[3] = {
+                        g_stream_selected_cache.gate_ptr +
+                            (uint64_t)i * table->gate_expert_bytes,
+                        g_stream_selected_cache.up_ptr +
+                            (uint64_t)i * table->gate_expert_bytes,
+                        g_stream_selected_cache.down_ptr +
+                            (uint64_t)i * table->down_expert_bytes
+                    };
+                    for (uint32_t k = 0; k < 3u && all; k++) {
+                        const cuda_pread_task *t = &tasks[m * 3u + k];
+                        if (cudaMemcpyAsync(dst[k], t->payload,
+                                            (size_t)t->bytes,
+                                            cudaMemcpyHostToDevice,
+                                            g_pread_pool_stream)
+                                != cudaSuccess) {
+                            (void)cudaGetLastError();
+                            all = 0;
+                        }
+                    }
+                }
+                if (cudaStreamSynchronize(g_pread_pool_stream) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    all = 0;
+                }
+                if (!all) break;
+                for (uint32_t m = 0; m < n; m++) prefilled[base + m] = 1u;
+            }
+        }
+    }
     for (uint32_t i = 0; i < compact_ids.size(); i++) {
+        if (prefilled[i]) continue;   /* already uploaded by the pread pool */
         const uint64_t expert = (uint32_t)compact_ids[i];
         const uint64_t gate_src =
             table->gate_offset + expert * table->gate_expert_bytes;
