@@ -525,6 +525,14 @@ static int cuda_q4_mma_ok(void) {
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
             cached = (major > 7 || (major == 7 && minor >= 5)) ? 1 : 0;
+            /* GB10 / sm_121: the Q8/Q4 MMA kernels launch successfully but
+             * write no output (observed on DGX Spark, driver 580.159: every
+             * n_tok>=8 Q8 matmul returned an untouched zero buffer while
+             * rc reported success). Disable MMA there until the kernels are
+             * validated on Blackwell integrated parts. */
+            if (major >= 12 && getenv("DS4_CUDA_MMA_SM12X") == NULL) {
+                cached = 0;
+            }
         }
     }
     return cached;
@@ -3319,6 +3327,15 @@ extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id,
     t->owner = 1;
     t->device_id = device_id;
     g_gpu[device_id].used_bytes += bytes;
+    if (getenv("DS4_CUDA_ALLOC_TRACE") &&
+        bytes >= (256ull << 20)) {
+        fprintf(stderr,
+                "ds4: CUDA alloc %.2f MiB (tier %d total %.2f GiB)\n",
+                (double)bytes / (1024.0 * 1024.0),
+                device_id,
+                (double)g_gpu[device_id].used_bytes /
+                    (1024.0 * 1024.0 * 1024.0));
+    }
     return 0;
 }
 
@@ -14865,7 +14882,27 @@ __global__ static void q8_0_dequant_f16_kernel(
     }
 }
 
+static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label);
+
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
+    const int rc = cuda_matmul_q8_0_tensor_labeled_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok, label);
+    if (getenv("DS4_Q8_TRACE")) {
+        float probe[2] = {0.0f, 0.0f};
+        float xin[2] = {0.0f, 0.0f};
+        (void)cudaDeviceSynchronize();
+        (void)cudaMemcpy(probe, out->ptr, sizeof(probe), cudaMemcpyDeviceToHost);
+        (void)cudaMemcpy(xin, x->ptr, sizeof(xin), cudaMemcpyDeviceToHost);
+        fprintf(stderr,
+                "ds4: q8trace off=%llu in=%llu out=%llu n=%llu rc=%d x0=%g %g y0=%g %g\n",
+                (unsigned long long)weight_offset,
+                (unsigned long long)in_dim, (unsigned long long)out_dim,
+                (unsigned long long)n_tok, rc,
+                xin[0], xin[1], probe[0], probe[1]);
+    }
+    return rc;
+}
+
+static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
@@ -14937,7 +14974,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 rc, label ? label : "", (unsigned long long)in_dim,
                 (unsigned long long)out_dim, (unsigned long long)n_tok);
     }
-    if (g_cublas_ready && n_tok > 1) {
+    if (g_cublas_ready && n_tok > 1 && getenv("DS4_Q8_NO_CUBLAS") == NULL) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, physical_device, label);
         if (w_f32) {
             const float alpha = 1.0f;
@@ -16319,7 +16356,7 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "f32");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    if (g_cublas_ready && n_tok > 1) {
+    if (g_cublas_ready && n_tok > 1 && getenv("DS4_Q8_NO_CUBLAS") == NULL) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasSgemm(cuda_cublas_for_tier(logical_tier),
@@ -20259,10 +20296,10 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     if (expert_i < 0) return;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
-    __shared__ cuda_block_q8_K sxq[16];
+    __shared__ cuda_block_q8_K sxq[24];
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
-    if (xq_blocks <= 16u) {
+    if (xq_blocks <= 24u) {
         for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
         for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
         for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
@@ -20323,10 +20360,10 @@ __global__ static void moe_gate_up_mid_decode_lut_owned_qwarp32_kernel(
     if (!moe_owned_local_expert(selected[pair], expert_base, expert_count,
                                 &expert)) return;
     const cuda_block_q8_K *xqb = xq;
-    __shared__ cuda_block_q8_K sxq[16];
+    __shared__ cuda_block_q8_K sxq[24];
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
-    if (xq_blocks <= 16u) {
+    if (xq_blocks <= 24u) {
         for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
         for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
         for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
@@ -21864,6 +21901,55 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile8_rowspan_kernel(
     }
 }
 
+/* GLM decode: direct down-sum across the 8 selected IQ2_XXS experts with
+ * the codebook staged in shared memory (divergent __constant__ lookups are
+ * the IQ2 decode bottleneck). owned_mask bit s clears slot s for the TP
+ * expert-ownership split; pass 0xff when unsplit. expert_addrs, when
+ * non-NULL, is the direct-pool address table (gate/up/down triplets); the
+ * NULL fallback reads base+index like every other down kernel. */
+__global__ static void moe_down_sum8_iq2xxs_lut_qwarp32_kernel(
+        float *out,
+        const char *down_base,
+        const unsigned long long *expert_addrs,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t owned_mask) {
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x)
+        s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x)
+        s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= out_dim) return;
+    float total = 0.0f;
+#pragma unroll
+    for (uint32_t slot = 0; slot < 8u; slot++) {
+        if (!((owned_mask >> slot) & 1u)) continue;
+        int32_t expert_i = selected[slot];
+        if (expert_i < 0) continue;
+        const char *dexp = expert_addrs ?
+            (const char *)(uintptr_t)expert_addrs[(uint32_t)expert_i * 3u + 2u] :
+            down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes;
+        const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)
+            (dexp + (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u)
+            acc += dev_dot_iq2_xxs_q8_K_block_lut(wr + b, xq + b,
+                                                  s_iq2_grid, s_iq2_signs);
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) total += acc;
+    }
+    if (lane == 0) out[row] = total;
+}
+
 __global__ static void moe_down_sum6_qwarp32_kernel(
         float *out,
         const char *down_base,
@@ -23353,6 +23439,61 @@ __global__ static void moe_down_sorted_qwarp32_kernel(
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
 }
 
+/* IQ2_XXS down twins of moe_down_qwarp32_kernel / moe_down_sorted_qwarp32_kernel
+ * for GLM routed layouts whose down experts are IQ2_XXS rather than Q2_K. */
+__global__ static void moe_down_iq2xxs_qwarp32_kernel(
+        float *down_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t pair = blockIdx.y;
+    if (row >= out_dim) return;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_iq2_xxs_q8_K_block(wr + b, xq + b);
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
+}
+
+__global__ static void moe_down_sorted_iq2xxs_qwarp32_kernel(
+        float *down_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const uint32_t *sorted_pairs,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t pair = sorted_pairs[blockIdx.y];
+    if (row >= out_dim) return;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_iq2_xxs_q8_K_block(wr + b, xq + b);
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
+}
+
 __global__ static DS4_CUDA_UNUSED void moe_down_expert_tile8_kernel(
         float *down_out,
         const char *down_base,
@@ -24003,7 +24144,15 @@ static int routed_moe_launch(
     const int q4k_path = (gate_type == 12u && down_type == 12u);
     const int iq2_path = (gate_type == 16u && down_type == 10u);
     const int mxfp4_path = (gate_type == 39u && down_type == 39u);
-    if (!q4k_path && !iq2_path && !mxfp4_path) return 0;
+    /* GLM routed IQ2_XXS layouts quantize the down experts as IQ2_XXS too;
+     * DeepSeek always pairs IQ2_XXS gate/up with Q2_K down. The IQ2_XXS-down
+     * path reuses the sorted/basic down kernels with the IQ2_XXS dot. */
+    const int iq2_down_path = (gate_type == 16u && down_type == 16u);
+    if (!q4k_path && !iq2_path && !mxfp4_path && !iq2_down_path) {
+        fprintf(stderr, "ds4: routed moe rejected: unsupported quant types gate=%u down=%u\n",
+                gate_type, down_type);
+        return 0;
+    }
 
     /* The aligned artifacts replace the raw expert tensors on integrated
      * CUDA systems.  Route both prefill and decode before resolving a raw
@@ -24403,9 +24552,17 @@ static int routed_moe_launch(
               getenv("DS4_CUDA_MOE_TILE4") == NULL));
         const uint32_t use_sorted_pairs =
             n_tokens > 1u &&
-            (owned_filtered || !q4k_path || use_q4_sorted_pairs);
+            (owned_filtered ||
+             ((!q4k_path || use_q4_sorted_pairs) &&
+              getenv("DS4_CUDA_MOE_NO_SORTED") == NULL));
+        /* The expert-tile gate/up kernels write mid in tile order, which the
+         * pair-ordered midq quantizer and the IQ2_XXS down kernels consume as
+         * garbage (all-IQ2_XXS GLM layouts have no tile-ordered down kernel).
+         * Verified on GB10: sorted-pairs without tiles matches the exact
+         * single-token oracle bit-for-token; with tiles the MoE output is
+         * uncorrelated noise. Keep tiles off for iq2-down layouts. */
         const uint32_t use_expert_tiles =
-            use_sorted_pairs &&
+            use_sorted_pairs && !iq2_down_path &&
             (owned_filtered || getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL);
         const uint32_t q4_owned_batch =
             owned_filtered && q4k_path && n_tokens >= 4u && n_tokens <= 16u;
@@ -24422,7 +24579,8 @@ static int routed_moe_launch(
         const uint32_t use_p2_sorted =
             use_sorted_pairs && !owned_filtered &&
             getenv("DS4_CUDA_MOE_NO_P2") == NULL;
-        const uint32_t use_atomic_down = !q4k_path && use_expert_tiles &&
+        const uint32_t use_atomic_down = !q4k_path && !iq2_down_path &&
+            use_expert_tiles &&
             (getenv("DS4_CUDA_MOE_ATOMIC_DOWN") != NULL ||
              (n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN") == NULL));
         const uint32_t use_owned_sparse_buffers = owned_filtered &&
@@ -24453,7 +24611,7 @@ static int routed_moe_launch(
             (q4_owned_batch || n_tokens >= 128u || force_q4_down_rowspan) &&
             getenv("DS4_CUDA_MOE_NO_Q4_DOWN_ROWSPAN") == NULL;
         const uint32_t use_decode_lut_gate =
-            n_tokens == 1u && xq_blocks <= 16u &&
+            n_tokens == 1u && xq_blocks <= 24u &&
             getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL;
         const uint32_t gate_row_span =
             getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ? 2048u :
@@ -24473,7 +24631,9 @@ static int routed_moe_launch(
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW128") == NULL &&
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW64") == NULL));
         const uint32_t use_direct_down_sum =
-            n_tokens == 1u && (n_expert == 6u || n_expert == 3u) &&
+            n_tokens == 1u &&
+            ((!iq2_down_path && (n_expert == 6u || n_expert == 3u)) ||
+             (iq2_down_path && n_expert == 8u)) &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
         /* 50/50 tensor parallelism (GLM decode over the streamed expert
          * cache).  Ownership was applied at staging time: peer-owned
@@ -25158,7 +25318,19 @@ static int routed_moe_launch(
                         }
                     }
                 } else {
-                    if (n_expert == 6u) {
+                    if (iq2_down_path && n_expert == 8u) {
+                        moe_down_sum8_iq2xxs_lut_qwarp32_kernel<<<sgrid, 256, 0, cuda_decode_stream()>>>(
+                            (float *)out->ptr,
+                            down_w,
+                            NULL, /* direct-pool addr table: not ported here */
+                            midq,
+                            (const int32_t *)selected->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            0xffu);
+                    } else if (n_expert == 6u) {
                         moe_down_sum6_qwarp32_kernel<<<sgrid, 256, 0, cuda_decode_stream()>>>(
                             (float *)out->ptr,
                             down_w,
@@ -25187,7 +25359,8 @@ static int routed_moe_launch(
             }
             if (use_direct_down_sum) {
                 /* The direct decode kernel writes the final token row. */
-            } else if (sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
+            } else if (!iq2_down_path &&
+                sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
                 down_tile_total && down_tile_experts && down_tile_starts) {
                 if (q4k_path) {
                     const int use_q4_down_mma = cuda_q4_mma_ok() &&
@@ -25320,7 +25493,7 @@ static int routed_moe_launch(
                         down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                         midq_blocks, out_dim, n_expert, use_atomic_down);
                 }
-            } else if (sorted_pairs && use_p2_sorted) {
+            } else if (!iq2_down_path && sorted_pairs && use_p2_sorted) {
                 dim3 p2_dgrid((out_dim + 15u) / 16u, (pair_count + 1u) / 2u, 1);
                 moe_down_sorted_p2_qwarp32_kernel<<<p2_dgrid, 256, 0, cuda_decode_stream()>>>(
                     (float *)down->ptr,
@@ -25334,12 +25507,35 @@ static int routed_moe_launch(
                     out_dim,
                     n_expert,
                     pair_count);
+            } else if (sorted_pairs && iq2_down_path) {
+                moe_down_sorted_iq2xxs_qwarp32_kernel<<<dgrid, 256, 0, cuda_decode_stream()>>>(
+                    (float *)down->ptr,
+                    down_w,
+                    midq,
+                    sorted_pairs,
+                    (const int32_t *)selected->ptr,
+                    down_expert_bytes,
+                    down_row_bytes,
+                    midq_blocks,
+                    out_dim,
+                    n_expert);
             } else if (sorted_pairs) {
                 moe_down_sorted_qwarp32_kernel<<<dgrid, 256, 0, cuda_decode_stream()>>>(
                     (float *)down->ptr,
                     down_w,
                     midq,
                     sorted_pairs,
+                    (const int32_t *)selected->ptr,
+                    down_expert_bytes,
+                    down_row_bytes,
+                    midq_blocks,
+                    out_dim,
+                    n_expert);
+            } else if (iq2_down_path) {
+                moe_down_iq2xxs_qwarp32_kernel<<<dgrid, 256, 0, cuda_decode_stream()>>>(
+                    (float *)down->ptr,
+                    down_w,
+                    midq,
                     (const int32_t *)selected->ptr,
                     down_expert_bytes,
                     down_row_bytes,
