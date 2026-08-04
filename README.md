@@ -20,35 +20,12 @@ their upstream `ds4` names; this repo tracks upstream and merges regularly.
 
 ## Why this exists
 
-On this same hardware vLLM serves **DeepSeek V4 Flash** superbly. Measured
-2026-07-27 on the same two Sparks (TP=2, DSpark speculative decoding):
-
-| | Flash on vLLM | GLM 5.2 here |
-|---|---:|---:|
-| prefill | **2,000–3,400 t/s** | 41 t/s |
-| decode, low fill | **55–59 t/s** | 4.3 t/s |
-| decode, ~5k filled | — | 2.4 t/s |
-| decode at 906k filled | 23.5 t/s | 0.59 t/s |
-| startup | ~5.5 min | ~15 s |
-
-**If Flash is the model you want, use vLLM.** It is roughly 50× the prefill and
-20× the decode, and nothing in this repo closes that gap.
-
-The two are not the same kind of artifact, which is the whole point:
-
-| | DeepSeek V4 Flash | GLM 5.2 (this repo) |
-|---|---|---|
-| quantization | **FP8** `e4m3`, block-wise `[128,128]`, dynamic activations | **IQ2_XXS**, ~2-bit routed experts |
-| on disk | 156 GB | **196.58 GiB** |
-| fits in 121.69 GiB? | yes, comfortably | **no** |
-| KV cache | `fp8_ds_mla` | packed fp8 e4m3 + per-row scales |
-| speculation | DSpark, 5 draft tokens (acceptance 3.5–6.0) | MTP probe only, not a win yet |
-
-Flash is 8-bit and fits. GLM is a substantially larger model crushed to a
-quarter of that bit-width and **still** does not fit — 196.58 GiB against
-121.69 GiB per Spark. That is what SSD streaming, the expert LRU pool and the
-two-box layer split exist to solve, and why the full 1,048,576-token window is
-usable here at all.
+GLM 5.2 at IQ2_XXS is **196.58 GiB** against **121.69 GiB** per Spark: a large
+model crushed to ~2-bit routed experts and it **still** does not fit in one
+box. That is what SSD streaming, the expert LRU pool and the two-box layer
+split exist to solve, and why the full 1,048,576-token window is usable here
+at all. The KV cache is packed fp8 (e4m3 + per-row scales), which is what
+makes the window affordable.
 
 ## Measured performance
 
@@ -147,9 +124,8 @@ also caps at half the context because it **replicates** the KV plane
 (`kv_layers=78` on *both* ranks) where pipeline **splits** it (40/38): GLM's DSA
 attention compresses KV into a per-token latent with no head dimension to shard.
 
-TP is faster only on short prompts — the regime this README routes to Flash. It
-stays in tree, runtime-gated and inert; the ds4-server integration is parked on
-`tp-cuda-server`.
+TP is faster only on short prompts. It stays in tree, runtime-gated and inert;
+the ds4-server integration is parked on `tp-cuda-server`.
 
 ### Maximum context
 
@@ -194,8 +170,7 @@ profile; this project ingests documents and sits on the other side of that line.
 
 **Not for realtime work.** Decode is 1–3 t/s and long prompts take minutes.
 Nothing about that improves with tuning; it is what a 2-bit 196 GiB model on two
-121 GiB boxes costs. **For chat, use V4 Flash on vLLM** — same hardware,
-2,000–3,400 t/s prefill and 55–59 t/s decode. Not a close call.
+121 GiB boxes costs.
 
 **This is for work where the answer is worth minutes and nobody is waiting:**
 reviewing a diff, auditing a subsystem, reading a design document end to end, a
@@ -203,14 +178,10 @@ nightly pass over the day's changes. The cost is paid once per artifact rather
 than per keystroke, and the whole 1M window holds the artifact plus everything
 it depends on.
 
-On quality, be careful what you conclude from local fixtures: both arms here
-scored 8/8 on authored coding tasks, which means the fixture was **saturated and
-could not discriminate** — a ceiling effect, not evidence of parity. Published
-benchmarks put GLM 5.2 ahead of V4 Flash. The operational argument is narrower
-and doesn't depend on that: it is a **second, independent reviewer** — different
-vendor, different architecture, uncorrelated blind spots — and notably more
-disciplined about *stating* a defect with a reproducer instead of quietly
-rewriting the code.
+Operationally it earns its keep as a **second, independent reviewer** —
+different vendor, different architecture, uncorrelated blind spots — and
+notably disciplined about *stating* a defect with a reproducer instead of
+quietly rewriting the code.
 
 ## Quick start
 
