@@ -2467,7 +2467,7 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
  * set this size on a box whose RAM is committed to KV and the expert
  * pool is never warm, so that result does not carry over here.
  * ------------------------------------------------------------------ */
-#define CUDA_PREAD_POOL_MAX_SLOTS   32u
+#define CUDA_PREAD_POOL_MAX_SLOTS   96u
 #define CUDA_PREAD_POOL_MAX_THREADS 32u
 
 typedef struct {
@@ -2500,6 +2500,9 @@ static void        *g_pread_bank[CUDA_PREAD_POOL_MAX_SLOTS];
 static uint64_t     g_pread_bank_bytes;
 static uint32_t     g_pread_bank_slots;
 static cudaStream_t g_pread_pool_stream;
+/* One per bank half: records when that bank's uploads have landed, which is
+ * what allows the bank to be refilled two waves later. */
+static cudaEvent_t  g_pread_bank_event[2];
 
 static int cuda_pread_pool_enabled(void) {
     static int cached = -1;
@@ -2577,6 +2580,15 @@ static int cuda_pread_bank_alloc(uint64_t slot_bytes, uint32_t slots) {
         g_pread_pool_stream = NULL;
         return 0;
     }
+    for (uint32_t b = 0; b < 2u; b++) {
+        if (g_pread_bank_event[b]) continue;
+        if (cudaEventCreateWithFlags(&g_pread_bank_event[b],
+                                     cudaEventDisableTiming) != cudaSuccess) {
+            (void)cudaGetLastError();
+            g_pread_bank_event[b] = NULL;
+            return 0;
+        }
+    }
     if (g_pread_bank_slots >= slots && g_pread_bank_bytes >= usable) return 1;
     for (uint32_t i = 0; i < g_pread_bank_slots; i++) {
         if (g_pread_bank_raw[i]) (void)cudaFreeHost(g_pread_bank_raw[i]);
@@ -2599,7 +2611,9 @@ static int cuda_pread_bank_alloc(uint64_t slot_bytes, uint32_t slots) {
 }
 
 /* Run every task concurrently; returns 1 only when all reads succeeded. */
-static int cuda_pread_pool_run(cuda_pread_task *tasks, uint32_t n) {
+/* Hand a batch to the workers and return immediately. Only one batch may be
+ * in flight; the caller must cuda_pread_pool_wait() before submitting again. */
+static int cuda_pread_pool_submit(cuda_pread_task *tasks, uint32_t n) {
     if (n == 0) return 1;
     if (!cuda_pread_pool_init()) return 0;
     pthread_mutex_lock(&g_pread_pool_mu);
@@ -2609,6 +2623,13 @@ static int cuda_pread_pool_run(cuda_pread_task *tasks, uint32_t n) {
     g_pread_pool_busy = g_pread_pool_nthreads;
     g_pread_pool_generation++;
     pthread_cond_broadcast(&g_pread_pool_start);
+    pthread_mutex_unlock(&g_pread_pool_mu);
+    return 1;
+}
+
+static int cuda_pread_pool_wait(cuda_pread_task *tasks, uint32_t n) {
+    if (n == 0) return 1;
+    pthread_mutex_lock(&g_pread_pool_mu);
     while (g_pread_pool_busy != 0)
         pthread_cond_wait(&g_pread_pool_done, &g_pread_pool_mu);
     g_pread_pool_tasks = NULL;
@@ -2617,6 +2638,22 @@ static int cuda_pread_pool_run(cuda_pread_task *tasks, uint32_t n) {
     for (uint32_t i = 0; i < n; i++)
         if (!tasks[i].ok) return 0;
     return 1;
+}
+
+/* Block until no worker is mid-batch. Used on the error/exit paths, where a
+ * submit may still be outstanding and the bank must not be reused under it. */
+static void cuda_pread_pool_drain(void) {
+    pthread_mutex_lock(&g_pread_pool_mu);
+    while (g_pread_pool_busy != 0)
+        pthread_cond_wait(&g_pread_pool_done, &g_pread_pool_mu);
+    g_pread_pool_tasks = NULL;
+    g_pread_pool_ntasks = 0;
+    pthread_mutex_unlock(&g_pread_pool_mu);
+}
+
+static int cuda_pread_pool_run(cuda_pread_task *tasks, uint32_t n) {
+    if (!cuda_pread_pool_submit(tasks, n)) return 0;
+    return cuda_pread_pool_wait(tasks, n);
 }
 
 static void cuda_stream_selected_stage_release(void) {
@@ -27205,16 +27242,27 @@ static int cuda_stream_selected_cache_begin_load(
         g_stream_selected_cache.down_ptr &&
         (g_model_fd_host_base == NULL ||
          table->model_map == g_model_fd_host_base)) {
-        const uint32_t per_wave = CUDA_PREAD_POOL_MAX_SLOTS / 3u;
+        /* Two banks, so wave w+1's reads run while wave w's uploads are in
+         * flight. With a single bank every wave ended in a stream sync and
+         * the drive sat idle through the upload: 8-16 threads reading 3 MiB
+         * each still only reached 2.25 GiB/s where one thread reading 9.5
+         * MiB sustains 5.5. Bank b is reused two waves later, so the event
+         * recorded after its uploads is what gates re-filling it. */
+        const uint32_t per_wave = CUDA_PREAD_POOL_MAX_SLOTS / 6u;
+        const uint32_t bank_slots = per_wave * 3u;
         const uint64_t slot_bytes =
             table->gate_expert_bytes > table->down_expert_bytes ?
             table->gate_expert_bytes : table->down_expert_bytes;
-        if (per_wave > 0 && cuda_pread_bank_alloc(slot_bytes, per_wave * 3u)) {
-            std::vector<cuda_pread_task> tasks(per_wave * 3u);
+        if (per_wave > 0 && cuda_pread_bank_alloc(slot_bytes, bank_slots * 2u)) {
+            std::vector<cuda_pread_task> tasks(bank_slots * 2u);
             const uint32_t n_ids = (uint32_t)compact_ids.size();
-            for (uint32_t base = 0; base < n_ids; base += per_wave) {
+            const uint32_t n_waves = (n_ids + per_wave - 1u) / per_wave;
+            /* fill tasks for wave w into bank w%2; returns its task count */
+            auto stage_wave = [&](uint32_t w) -> uint32_t {
+                const uint32_t base = w * per_wave;
                 const uint32_t n = n_ids - base < per_wave ?
                                    n_ids - base : per_wave;
+                const uint32_t slot0 = (w & 1u) * bank_slots;
                 for (uint32_t m = 0; m < n; m++) {
                     const uint64_t expert = (uint32_t)compact_ids[base + m];
                     const uint64_t off[3] = {
@@ -27228,8 +27276,8 @@ static int cuda_stream_selected_cache_begin_load(
                         table->down_expert_bytes
                     };
                     for (uint32_t k = 0; k < 3u; k++) {
-                        cuda_pread_task *t = &tasks[m * 3u + k];
-                        t->stage       = g_pread_bank[m * 3u + k];
+                        cuda_pread_task *t = &tasks[slot0 + m * 3u + k];
+                        t->stage       = g_pread_bank[slot0 + m * 3u + k];
                         t->stage_bytes = g_pread_bank_bytes;
                         t->offset      = off[k];
                         t->bytes       = len[k];
@@ -27237,9 +27285,39 @@ static int cuda_stream_selected_cache_begin_load(
                         t->ok          = 0;
                     }
                 }
-                if (!cuda_pread_pool_run(tasks.data(), n * 3u)) break;
-                int all = 1;
-                for (uint32_t m = 0; m < n && all; m++) {
+                return n;
+            };
+            int all = 1;
+            uint32_t n_cur = n_waves ? stage_wave(0) : 0u;
+            if (n_cur && !cuda_pread_pool_submit(&tasks[0], n_cur * 3u))
+                all = 0;
+            for (uint32_t w = 0; all && w < n_waves; w++) {
+                const uint32_t base = w * per_wave;
+                const uint32_t slot0 = (w & 1u) * bank_slots;
+                if (!cuda_pread_pool_wait(&tasks[slot0], n_cur * 3u)) {
+                    all = 0;
+                    break;
+                }
+                /* Start the next wave's reads before issuing this wave's
+                 * uploads: different bank, so they cannot collide, and the
+                 * drive stays busy across the upload. */
+                uint32_t n_next = 0;
+                if (w + 1u < n_waves) {
+                    if (w >= 1u &&
+                        cudaEventSynchronize(g_pread_bank_event[(w + 1u) & 1u])
+                            != cudaSuccess) {
+                        (void)cudaGetLastError();
+                        all = 0;
+                        break;
+                    }
+                    n_next = stage_wave(w + 1u);
+                    const uint32_t nslot0 = ((w + 1u) & 1u) * bank_slots;
+                    if (!cuda_pread_pool_submit(&tasks[nslot0], n_next * 3u)) {
+                        all = 0;
+                        break;
+                    }
+                }
+                for (uint32_t m = 0; m < n_cur && all; m++) {
                     const uint32_t i = base + m;
                     char *dst[3] = {
                         g_stream_selected_cache.gate_ptr +
@@ -27250,7 +27328,7 @@ static int cuda_stream_selected_cache_begin_load(
                             (uint64_t)i * table->down_expert_bytes
                     };
                     for (uint32_t k = 0; k < 3u && all; k++) {
-                        const cuda_pread_task *t = &tasks[m * 3u + k];
+                        const cuda_pread_task *t = &tasks[slot0 + m * 3u + k];
                         if (cudaMemcpyAsync(dst[k], t->payload,
                                             (size_t)t->bytes,
                                             cudaMemcpyHostToDevice,
@@ -27261,12 +27339,22 @@ static int cuda_stream_selected_cache_begin_load(
                         }
                     }
                 }
-                if (cudaStreamSynchronize(g_pread_pool_stream) != cudaSuccess) {
+                if (all &&
+                    cudaEventRecord(g_pread_bank_event[w & 1u],
+                                    g_pread_pool_stream) != cudaSuccess) {
                     (void)cudaGetLastError();
                     all = 0;
                 }
-                if (!all) break;
-                for (uint32_t m = 0; m < n; m++) prefilled[base + m] = 1u;
+                if (all) for (uint32_t m = 0; m < n_cur; m++)
+                    prefilled[base + m] = 1u;
+                n_cur = n_next;
+            }
+            /* Drain whatever is still outstanding before the bank is reused
+             * by the next layer, whether or not the pipeline completed. */
+            cuda_pread_pool_drain();
+            if (cudaStreamSynchronize(g_pread_pool_stream) != cudaSuccess) {
+                (void)cudaGetLastError();
+                for (uint32_t m = 0; m < n_ids; m++) prefilled[m] = 0u;
             }
         }
     }
