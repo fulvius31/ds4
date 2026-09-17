@@ -1182,6 +1182,30 @@ extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
     return 0;
 }
 
+/* Network-TP prefill: let owned (rank-filtered) expert assignments take the
+ * fused-direct D2R tier.  moe_filter_owned_pairs_kernel remaps owned experts
+ * to rank-local ids and writes -1 (weight 0) for foreign ones; mm_ids_helper
+ * drops the -1 entries and the D2R kernels only walk
+ * expert_bounds[e]..expert_bounds[e+1], so a foreign expert has zero rows and
+ * its weights are never read -- the same contract the vendored mul_mat_q
+ * fallback already relies on.  Measured on two DGX Sparks: a 31,121-token
+ * prefill goes 380 -> 402 t/s (+5.8%), tests/test_deepseek41_prefill
+ * --tensor-parallel-cuda passes with it on, and over 256 greedy tokens the
+ * result sits no farther from the single-box D2R reference than the vendored
+ * path does (step-0 |delta logprob| 0.091 vs 0.154; scalar, batched and TP
+ * are documented as not numerically identical).  Default on;
+ * DS4_CUDA_TP_MOE_DIRECT=0 restores the vendored dispatch. */
+static int cuda_tp_moe_direct_enabled(void) {
+    static int init = 0;
+    static int use = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_TP_MOE_DIRECT");
+        use = !(s && s[0] == '0');
+    }
+    return use;
+}
+
 static int cuda_use_mmq(void) {
     static int init = 0;
     static int use = 0;
@@ -6182,7 +6206,8 @@ __global__ static void matmul_q8_0_mma_exact_kernel(
         uint64_t n_tok,
         uint64_t blocks,
         uint64_t a_stride_blocks, /* activation row stride in blocks (>= blocks) */
-        uint64_t out_stride) {    /* output token stride in floats (>= out_dim) */
+        uint64_t out_stride,      /* output token stride in floats (>= out_dim) */
+        uint64_t w_stride_blocks) { /* weight row stride in blocks (>= blocks) */
     extern __shared__ unsigned char q8mma_sh[];
     /* Different output rows/tokens read the same block simultaneously.
      * Padded pitches keep their scales in distinct shared-memory banks. */
@@ -6203,7 +6228,7 @@ __global__ static void matmul_q8_0_mma_exact_kernel(
         const uint32_t b = idx - rl * (uint32_t)blocks;
         uint64_t row = row_base + rl;
         if (row >= out_dim) row = out_dim - 1u;
-        sh_ws[rl * ws_pitch + b] = *(const __half *)(w + row * blocks * 34u + (uint64_t)b * 34u);
+        sh_ws[rl * ws_pitch + b] = *(const __half *)(w + row * w_stride_blocks * 34u + (uint64_t)b * 34u);
     }
     for (uint32_t idx = threadIdx.x; idx < 16u * (uint32_t)blocks; idx += blockDim.x) {
         const uint32_t tl = idx / (uint32_t)blocks;
@@ -6229,7 +6254,7 @@ __global__ static void matmul_q8_0_mma_exact_kernel(
     /* B source row for loads: row lane>>2 within the warp tile */
     uint64_t b_row = row0 + (lane >> 2u);
     if (b_row >= out_dim) b_row = out_dim - 1u;
-    const unsigned char *b_wr = w + b_row * blocks * 34u;
+    const unsigned char *b_wr = w + b_row * w_stride_blocks * 34u;
 
     /* per-element (4) x per-(j&3) accumulators */
     float acc00 = 0.0f, acc01 = 0.0f, acc02 = 0.0f, acc03 = 0.0f;
@@ -6354,7 +6379,7 @@ static int cuda_q4_mma_ok(void) {
     return cached;
 }
 static int cuda_q8_mma_attr_ready[DS4_MAX_GPUS][4];
-static int cuda_q8_mma_try_launch(
+static int cuda_q8_mma_try_launch_ex(
         float *out,
         const unsigned char *w,
         const int8_t *xq,
@@ -6365,7 +6390,9 @@ static int cuda_q8_mma_try_launch(
         uint64_t blocks,
         uint64_t a_stride_blocks,
         uint64_t out_stride,
-        uint32_t T) {
+        uint32_t T,
+        uint64_t w_stride_blocks, /* >= blocks; == blocks for a full-K matmul */
+        cudaStream_t stream) {
     static int disabled = -1;
     if (disabled < 0) disabled = getenv("DS4_CUDA_NO_Q8_MMA") != NULL ? 1 : 0;
     if (disabled || !cuda_q4_mma_ok()) return 0;
@@ -6399,9 +6426,9 @@ static int cuda_q8_mma_try_launch(
             } \
             cuda_q8_mma_attr_ready[dev][ti] = 1; \
         } \
-        matmul_q8_0_mma_exact_kernel<TT><<<grid, 256, shmem>>>( \
+        matmul_q8_0_mma_exact_kernel<TT><<<grid, 256, shmem, stream>>>( \
                 out, w, xq, xscale, in_dim, out_dim, n_tok, blocks, \
-                a_stride_blocks, out_stride); \
+                a_stride_blocks, out_stride, w_stride_blocks); \
     } while (0)
     if (T == 32u) DS4_Q8_MMA_LAUNCH(32u);
     else if (T == 64u) DS4_Q8_MMA_LAUNCH(64u);
@@ -6409,6 +6436,25 @@ static int cuda_q8_mma_try_launch(
     else DS4_Q8_MMA_LAUNCH(256u);
 #undef DS4_Q8_MMA_LAUNCH
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 mma launch") ? 1 : -1;
+}
+
+/* Full-K form on the default stream: the historical signature every
+ * non-slice caller uses. */
+static int cuda_q8_mma_try_launch(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok,
+        uint64_t blocks,
+        uint64_t a_stride_blocks,
+        uint64_t out_stride,
+        uint32_t T) {
+    return cuda_q8_mma_try_launch_ex(out, w, xq, xscale, in_dim, out_dim, n_tok,
+                                     blocks, a_stride_blocks, out_stride, T,
+                                     blocks, (cudaStream_t)0);
 }
 
 
@@ -15256,6 +15302,17 @@ extern "C" int ds4_gpu_matmul_q8_0_top1_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_top1 unpack launch");
 }
 
+/* Network-TP prefill K-slice: DS4_CUDA_NO_KSLICE_MMA=1 keeps the warp kernel. */
+static int cuda_kslice_mma_disabled(void) {
+    static int init = 0;
+    static int off = 0;
+    if (!init) {
+        init = 1;
+        off = getenv("DS4_CUDA_NO_KSLICE_MMA") != NULL;
+    }
+    return off;
+}
+
 extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         ds4_gpu_tensor *out,
         const void *model_map,
@@ -15305,6 +15362,21 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
             in_count,
             slice_blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_kslice quantize launch")) return 0;
+    /* Batched rows: the INT8 MMA kernel with T=32 reproduces this warp
+     * kernel's per-lane strided walk and 32-slot halving tree bit for bit
+     * (see matmul_q8_0_mma_exact_kernel).  The slice is expressed as a
+     * weight row stride of full_blocks with the row base advanced to
+     * block_start.  On two DGX Sparks the warp-per-(row, token) kernel was
+     * 24% of TP prefill GPU time on attn_output_b (in 1024, slice 512,
+     * out 4096) because nothing is reused across the tokens of a chunk. */
+    if (n_tok >= 8u && !cuda_kslice_mma_disabled()) {
+        const int mma_rc = cuda_q8_mma_try_launch_ex(
+                (float *)out->ptr, wptr + block_start * 34u, xq, xscale,
+                in_count, out_dim, n_tok, slice_blocks, slice_blocks, out_dim,
+                32u, full_blocks, cuda_decode_stream());
+        if (mma_rc > 0) return 1;
+        if (mma_rc < 0) return 0;
+    }
     const dim3 grid(((unsigned)out_dim + 7u) / 8u,
                     (unsigned)n_tok, 1u);
     matmul_q8_0_kslice_preq_warp8_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
@@ -18237,6 +18309,16 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                                       n_comp, window, ratio, n_head, head_dim);
 }
 
+static int cuda_tp_tokentile_64_only(void) {
+    static int init = 0;
+    static int only64 = 0;
+    if (!init) {
+        init = 1;
+        only64 = getenv("DS4_CUDA_TP_TOKENTILE_64_ONLY") != NULL;
+    }
+    return only64;
+}
+
 extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -18277,8 +18359,18 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier, "attn_sinks");
     if (!sinks) return 0;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
+    /* Network TP hands each rank its packed local head set (32 of 64).
+     * The token-tile kernels take n_head as a parameter (grid n_head / kTTG,
+     * gh < n_head bounds; union build and mirrors do not depend on it), so
+     * any multiple of kTTG up to 64 runs the same code the single-box path
+     * validates.  Before this, a TP rank fell to the online kernel: 2.41 s
+     * per rank for 32 heads vs 0.996 s for all 64 on one box (nsys, two DGX
+     * Sparks, 7,893-token prefill).  DS4_CUDA_TP_TOKENTILE_64_ONLY=1 restores
+     * the 64-head-only gate. */
     if (g_n_gpus == 1 && n_tokens >= 128u && head_dim == kTTHeadDim &&
-        n_head == 64u && top_k == 512u && window == kTTRawWindow &&
+        (n_head == 64u || (n_head % kTTG == 0u && n_head < 64u &&
+                           !cuda_tp_tokentile_64_only())) &&
+        top_k == 512u && window == kTTRawWindow &&
         ratio != 0u && n_comp <= 32768u &&
         n_raw >= n_tokens &&
         (uint64_t)n_raw <= (uint64_t)pos0 + n_tokens &&
@@ -24540,7 +24632,8 @@ static int routed_moe_launch(
                 rc = 1;
                 const uint64_t assignments =
                     (uint64_t)n_tokens * n_expert;
-                if (!owned_filtered && assignments >= 1024u) {
+                if ((!owned_filtered || cuda_tp_moe_direct_enabled()) &&
+                    assignments >= 1024u) {
                     size_t input_q8_bytes = 0;
                     size_t down_q8_bytes = 0;
                     size_t work_bytes = 0;
