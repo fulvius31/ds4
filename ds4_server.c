@@ -10013,6 +10013,7 @@ struct server_slot {
     job *assigned;
     job *running;
     bool busy;
+    double live_last_activity;  /* now_sec() when this slot last finished a turn; admission control */
     bool prefill_waiting;
 
     bool decode_pending;
@@ -10201,6 +10202,7 @@ struct job {
     request req;
     bool done;
     bool cancelled;
+    bool admission_rejected;  /* set by protect-live guard so the wrapper skips the activity stamp */
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
@@ -13295,6 +13297,35 @@ static void *decode_worker_main(void *arg) {
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
+/* Admission control (DS4_SERVER_PROTECT_LIVE): with a single KV slot, a request
+ * from a different conversation would evict the resident live session and force
+ * it to re-prefill its whole context on its next turn.  When enabled, such a
+ * request is rejected with 503 instead, protecting the incumbent.  A request is
+ * "different" only if it shares almost no prefix (common < COMMON_MIN) and owns
+ * no live call-ids, so the incumbent's own continuations are never rejected; and
+ * only while the incumbent is recent (idle < GRACE_S), so an abandoned session
+ * can still be taken over. */
+static int server_protect_live_enabled(void) {
+    static int init = 0, on = 0;
+    if (!init) { init = 1; const char *e = getenv("DS4_SERVER_PROTECT_LIVE"); on = e && e[0] == '1'; }
+    return on;
+}
+static int server_protect_live_common_min(void) {
+    static int init = 0, v = 1024;
+    if (!init) { init = 1; const char *e = getenv("DS4_SERVER_PROTECT_LIVE_COMMON_MIN"); if (e && e[0]) { int x = atoi(e); if (x > 0) v = x; } }
+    return v;
+}
+static double server_protect_live_grace_s(void) {
+    static int init = 0; static double v = 900.0;
+    if (!init) { init = 1; const char *e = getenv("DS4_SERVER_PROTECT_LIVE_GRACE_S"); if (e && e[0]) { double x = atof(e); if (x > 0) v = x; } }
+    return v;
+}
+static int server_protect_live_min_tokens(void) {
+    static int init = 0, v = 4096;  /* only protect a meaningful context, not a probe/quick chat */
+    if (!init) { init = 1; const char *e = getenv("DS4_SERVER_PROTECT_LIVE_MIN_TOKENS"); if (e && e[0]) { int x = atoi(e); if (x > 0) v = x; } }
+    return v;
+}
+
 static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
@@ -13437,6 +13468,23 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    old_pos, j->req.prompt.len, common,
                    live_vision_match ? "match" : "mismatch",
                    trace_cache_miss_reason(&cache_diag));
+    }
+    if (cached == 0 && old_pos >= server_protect_live_min_tokens() &&
+        server_protect_live_enabled() &&
+        common < server_protect_live_common_min() &&
+        responses_live_match_ids == 0 && anthropic_live_match_ids == 0) {
+        const double idle = now_sec() - slot->live_last_activity;
+        if (idle < server_protect_live_grace_s()) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: 503 protect-live%s: request (common=%d) would evict "
+                       "a live session (%d tok, idle %.0fs); rejecting",
+                       responses_protocol ? " RESPPROTO" : "", common, old_pos, idle);
+            j->admission_rejected = true;
+            ds4_tokens_free(&effective_prompt);
+            http_error(j->fd, s->enable_cors, 503,
+                       "The model is serving another session; retry shortly");
+            return;
+        }
     }
     if (multimodal && cached > 0) {
         server_log(DS4_LOG_KVCACHE,
@@ -14601,6 +14649,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
     ds4_session_set_cancel(slot->session, NULL, NULL);
+    if (!j->admission_rejected) slot->live_last_activity = now_sec();
 
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;
